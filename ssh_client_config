@@ -1,0 +1,8 @@
+# ─── Local machine ~/.ssh/config ─────────────────────────────────
+# Add this to ~/.ssh/config on your local machine
+
+Host cloud-dev
+  HostName 46.62.212.195
+  User mds
+  ServerAliveInterval 60
+  ServerAliveCountMax 10

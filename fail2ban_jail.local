@@ -1,0 +1,10 @@
+# ─── Fail2ban SSH protection ─────────────────────────────────────
+# Lives at /etc/fail2ban/jail.local on the VM
+# Bans IPs after 5 failed SSH attempts for 1 hour
+
+[sshd]
+enabled = true
+port = ssh
+maxretry = 5
+bantime = 3600
+findtime = 600

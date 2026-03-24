@@ -1,0 +1,12 @@
+# ─── Hardened SSH server settings ────────────────────────────────
+# These values should be set in /etc/ssh/sshd_config on the VM
+# After editing, restart SSH: sudo systemctl restart ssh
+
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+X11Forwarding no
+AllowTcpForwarding yes
+MaxAuthTries 3
+ClientAliveInterval 300
+ClientAliveCountMax 2
