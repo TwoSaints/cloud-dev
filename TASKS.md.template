@@ -1,0 +1,23 @@
+# Tasks
+
+<!--
+  This file is Claude's work queue for this repo.
+  Claude will pick up tasks from "Ready" when it finishes work.
+  Move tasks between sections as their status changes.
+  Keep descriptions clear enough that Claude can start without asking.
+-->
+
+## Ready
+<!-- Claude can start these immediately -->
+- [ ] Example: Add input validation to the POST /tasks endpoint
+
+## In Progress
+<!-- Currently being worked on -->
+
+## Needs Decision
+<!-- Blocked on your input — add a note with context -->
+- [ ] Example: Should we use Redis or in-memory caching for sessions?
+  > Note: Current load is low but expecting 10x growth in 3 months
+
+## Done
+<!-- Completed tasks — keep for reference -->

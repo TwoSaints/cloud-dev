@@ -1,11 +1,12 @@
 #!/bin/bash
 # start-projects.sh — Bootstrap all project tmux sessions
 # Lives at ~/start-projects.sh on the VM
-# Auto-started on reboot via systemd (see setup.sh)
+# Auto-started on reboot via systemd
 
 # ─── Project config ───────────────────────────────────────────────
 # Add frontend/backend start commands per project here.
 # Leave empty "" if a project doesn't have one.
+# Windows are only created for commands that are non-empty.
 declare -A FRONTEND_CMD
 declare -A BACKEND_CMD
 
@@ -21,11 +22,12 @@ BACKEND_CMD["todolisto"]="python -m uvicorn todolisto.api.app:app --reload"
 
 # ─── Project list ─────────────────────────────────────────────────
 # Format: "session-name:absolute-path"
-# 'os' is a special session rooted at ~ for VM management
+# 'os' is special — rooted at ~ for VM-level management tasks
 PROJECTS=(
   "os:$HOME"
   "todolisto:$HOME/projects/personal/todolisto"
   "velais-vdx:$HOME/projects/velais/velais-vdx"
+  "aihub-infra:$HOME/projects/velais/client/aihub-infra"
   "m2-labs:$HOME/projects/m2/m2-labs"
   "m2-site:$HOME/projects/m2/m2-site"
 )
@@ -37,36 +39,42 @@ create_session() {
   local frontend="${FRONTEND_CMD[$name]}"
   local backend="${BACKEND_CMD[$name]}"
 
-  # Create session with explicit dimensions (required for headless server)
-  tmux new-session -d -s "$name" -c "$path" -x 220 -y 50
-  tmux rename-window -t "$name" "main"
-
-  if [ "$name" != "os" ]; then
-    # Split bottom 10 rows for frontend and backend panes
-    tmux split-window -t "$name:main" -v -l 10 -c "$path"
-    # Split bottom pane in half horizontally
-    tmux split-window -t "$name:main.1" -h -c "$path"
-
-    # Name the panes
-    tmux select-pane -t "$name:main.0" -T "claude"
-    tmux select-pane -t "$name:main.1" -T "frontend"
-    tmux select-pane -t "$name:main.2" -T "backend"
-
-    # Start frontend if configured
-    if [ -n "$frontend" ]; then
-      tmux send-keys -t "$name:main.1" "$frontend" Enter
-    fi
-
-    # Start backend if configured
-    if [ -n "$backend" ]; then
-      tmux send-keys -t "$name:main.2" "$backend" Enter
-    fi
+  # Skip if path doesn't exist
+  if [ ! -d "$path" ]; then
+    echo "  ⚠ Skipping '$name' — path not found: $path"
+    return
   fi
 
-  # Start Claude remote-control in top pane (or only pane for 'os')
-  tmux send-keys -t "$name:main.0" "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
+  # Create session with explicit dimensions (required for headless server)
+  tmux new-session -d -s "$name" -c "$path" -x 220 -y 50
+
+  # Window 0: claude (always) ──────────────────────────────────────
+  tmux rename-window -t "$name:0" "claude"
+  tmux send-keys -t "$name:claude" \
+    "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
   sleep 3
-  tmux send-keys -t "$name:main.0" "y" Enter
+  tmux send-keys -t "$name:claude" "y" Enter
+
+  # Window 1: shell (always, except 'os') ──────────────────────────
+  if [ "$name" != "os" ]; then
+    tmux new-window -t "$name" -n "shell" -c "$path"
+    tmux send-keys -t "$name:shell" "git status" Enter
+  fi
+
+  # Window 2: frontend (conditional) ───────────────────────────────
+  if [ -n "$frontend" ]; then
+    tmux new-window -t "$name" -n "frontend" -c "$path"
+    tmux send-keys -t "$name:frontend" "$frontend" Enter
+  fi
+
+  # Window 3: backend (conditional) ────────────────────────────────
+  if [ -n "$backend" ]; then
+    tmux new-window -t "$name" -n "backend" -c "$path"
+    tmux send-keys -t "$name:backend" "$backend" Enter
+  fi
+
+  # Return focus to claude window
+  tmux select-window -t "$name:claude"
 }
 
 # ─── Bootstrap ────────────────────────────────────────────────────
@@ -75,12 +83,24 @@ for entry in "${PROJECTS[@]}"; do
   path="${entry##*:}"
 
   if tmux has-session -t "$name" 2>/dev/null; then
-    echo "Session '$name' already running — skipping"
+    echo "  ↩ '$name' already running — skipping"
   else
     create_session "$name" "$path"
-    echo "Started: $name"
+    echo "  ✓ Started: $name"
   fi
 done
 
 echo ""
-echo "Sessions ready. Use 'projects' to list, 'rc <name>' to switch focus."
+echo "Sessions ready."
+echo ""
+echo "  projects        — list all sessions"
+echo "  rc <name>       — point remote control at a project"
+echo "  go <name>       — attach terminal to a session"
+echo "  restart <name>  — kill and recreate a session"
+echo "  newproject <org>/<repo> <folder>  — clone and spin up a new project"
+echo ""
+echo "  Ctrl+B 0  — claude (always)"
+echo "  Ctrl+B 1  — shell  (always)"
+echo "  Ctrl+B 2  — frontend (if configured)"
+echo "  Ctrl+B 3  — backend  (if configured)"
+echo "  Ctrl+B D  — detach without killing"

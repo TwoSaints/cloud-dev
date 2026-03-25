@@ -115,14 +115,40 @@ PYENV
 chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc
 echo "Done."
 
-# ─── 9. Install 1Password CLI ────────────────────────────────────
-echo "[9/9] Installing 1Password CLI..."
+# ─── 9. Configure git identity ───────────────────────────────────
+echo "[9/10] Configuring git identity..."
+su - $USERNAME -c '
+git config --global user.name "MDS"
+git config --global user.email "michaeljamesds@gmail.com"
+git config --global user.useConfigOnly true
+git config --global init.defaultBranch main
+git config --global pull.rebase false
+git config --global includeIf.gitdir:~/projects/velais/.path ~/.gitconfig-velais
+git config --global includeIf.gitdir:~/projects/velais/client/.path ~/.gitconfig-velais
+git config --global includeIf.gitdir:~/projects/m2/.path ~/.gitconfig-velais
+
+cat > ~/.gitconfig-velais << "VELAIS"
+[user]
+  email = michael.dos.santos@velais.com
+VELAIS
+'
+echo "Done."
+
+# ─── 10. Install 1Password CLI ───────────────────────────────────
+echo "[10/11] Installing 1Password CLI..."
 curl -sS https://downloads.1password.com/linux/keys/1password.asc \
   | gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] \
 https://downloads.1password.com/linux/debian/$(dpkg --print-architecture) stable main" \
   | tee /etc/apt/sources.list.d/1password.list
 apt update && apt install -y 1password-cli
+echo "Done."
+
+# ─── 11. Install GSD (Get Shit Done) globally ─────────────────────
+echo "[11/11] Installing GSD for Claude Code..."
+su - $USERNAME -c '
+  npx get-shit-done-cc@latest --claude --global --yes
+'
 echo "Done."
 
 echo ""
@@ -133,6 +159,14 @@ echo "  1. Open a new terminal and test: ssh $USERNAME@<ip>"
 echo "  2. SSH in as $USERNAME and run:"
 echo "     - ssh-keygen -t ed25519 -C 'hetzner-cloud-dev' -f ~/.ssh/github_vm"
 echo "     - Add ~/.ssh/github_vm.pub to GitHub SSH keys"
+echo "     - npm install -g @anthropic-ai/claude-code"
+echo "     - claude  (then /login to authenticate)"
+echo "     - Copy start-projects.sh to ~/ and run it"
+echo "  3. Set up Hetzner firewall (see docs/hetzner-firewall.md)"
+echo "  4. Reboot to apply kernel updates: sudo reboot"
+echo ""
+echo "GSD is installed globally at ~/.claude/commands/gsd/"
+echo "Verify with: /gsd:help inside any Claude Code session"
 echo "     - npm install -g @anthropic-ai/claude-code"
 echo "     - claude  (then /login to authenticate)"
 echo "     - Copy start-projects.sh to ~/ and run it"

@@ -1,61 +1,221 @@
-# ─── cloud-dev shell additions ────────────────────────────────────
-# Append to ~/.bashrc on the VM
-# Also append tunnel() and its dependencies to ~/.zshrc on local machine
+# ═══════════════════════════════════════════════════════════════════
+# cloud-dev shell additions
+# ─── VM: append to ~/.bashrc
+# ─── Local Mac: append tunnel/tunnels to ~/.zshrc
+# ═══════════════════════════════════════════════════════════════════
 
-# ─── VM aliases ───────────────────────────────────────────────────
+# ─── Session management ───────────────────────────────────────────
 
-# List all project tmux sessions
+# List all tmux sessions
 alias projects='tmux ls'
 
 # Attach to a project session
-go() { tmux attach -t "$1"; }
+# Usage: go todolisto
+go() {
+  if [ -z "$1" ]; then
+    echo "Usage: go <session-name>"
+    tmux ls
+    return 1
+  fi
+  if ! tmux has-session -t "$1" 2>/dev/null; then
+    echo "✗ Session '$1' not found. Running sessions:"
+    tmux ls
+    return 1
+  fi
+  tmux attach -t "$1"
+}
+
+# Toggle GSD text_mode in a project's .planning/config.json
+# Usage: _gsd_set_text_mode <project_path> <true|false>
+_gsd_set_text_mode() {
+  local path=$1
+  local value=$2
+  local config="$path/.planning/config.json"
+
+  # Only act if .planning/config.json exists (i.e. GSD has been initialised)
+  if [ ! -f "$config" ]; then
+    return 0
+  fi
+
+  python3 - "$config" "$value" << 'PYEOF'
+import json, sys
+config_path, value = sys.argv[1], sys.argv[2] == "true"
+with open(config_path, "r") as f:
+    config = json.load(f)
+config.setdefault("workflow", {})["text_mode"] = value
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2)
+PYEOF
+}
+
+# Get the project root path for a tmux session via its shell window
+_session_path() {
+  tmux display-message -t "$1:shell" -p "#{pane_current_path}" 2>/dev/null
+}
 
 # Switch Remote Control focus to a project
+# Automatically enables GSD text_mode on the incoming session
+# and disables it on the outgoing session
 # Usage: rc todolisto
 rc() {
-  tmux send-keys -t "$1:main.0" C-c ""
+  if [ -z "$1" ]; then
+    echo "Usage: rc <session-name>"
+    tmux ls
+    return 1
+  fi
+  if ! tmux has-session -t "$1" 2>/dev/null; then
+    echo "✗ Session '$1' not found. Running sessions:"
+    tmux ls
+    return 1
+  fi
+
+  local RC_STATE="$HOME/.rc_current"
+  local incoming="$1"
+
+  # ── Disable text_mode on outgoing session ────────────────────────
+  if [ -f "$RC_STATE" ]; then
+    local outgoing=$(cat "$RC_STATE")
+    if [ -n "$outgoing" ] && [ "$outgoing" != "$incoming" ]; then
+      local out_path=$(_session_path "$outgoing")
+      if [ -n "$out_path" ]; then
+        _gsd_set_text_mode "$out_path" false
+        echo "  GSD text_mode off → $outgoing"
+      fi
+    fi
+  fi
+
+  # ── Enable text_mode on incoming session ─────────────────────────
+  local in_path=$(_session_path "$incoming")
+  if [ -n "$in_path" ]; then
+    _gsd_set_text_mode "$in_path" true
+    echo "  GSD text_mode on  → $incoming"
+  fi
+
+  # ── Record current RC session ────────────────────────────────────
+  echo "$incoming" > "$RC_STATE"
+
+  # ── Restart remote-control in the target session ─────────────────
+  tmux send-keys -t "$incoming:claude" C-c ""
   sleep 1
-  tmux send-keys -t "$1:main.0" "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
+  tmux send-keys -t "$incoming:claude" \
+    "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
   sleep 3
-  tmux send-keys -t "$1:main.0" "y" Enter
-  echo "Remote Control now pointing at: $1"
+  tmux send-keys -t "$incoming:claude" "y" Enter
+
+  echo "✓ Remote Control → $incoming"
 }
+
+# Kill and recreate a single session (without restarting everything)
+# Usage: restart todolisto
+restart() {
+  if [ -z "$1" ]; then
+    echo "Usage: restart <session-name>"
+    return 1
+  fi
+  echo "Restarting session: $1"
+  tmux kill-session -t "$1" 2>/dev/null || true
+  ~/start-projects.sh
+}
+
+# ─── Project creation ─────────────────────────────────────────────
 
 # Clone a repo and spin up its tmux session in one command
 # Usage: newproject <org>/<repo> <folder>
-# Example: newproject velais-ai-solutions/client-abc velais/client
+# Examples:
+#   newproject TwoSaints/aria personal
+#   newproject velais-ai-solutions/client-abc velais/client
+#   newproject m2mpwr/m2-brand m2
 newproject() {
+  if [ -z "$1" ] || [ -z "$2" ]; then
+    echo "Usage: newproject <org>/<repo> <folder>"
+    echo "  e.g. newproject velais-ai-solutions/my-repo velais/client"
+    return 1
+  fi
+
   local repo=$1
   local folder=$2
   local name=$(basename "$repo")
   local path="$HOME/projects/$folder/$name"
 
-  git clone "git@github.com:$repo.git" "$path"
+  # Check session doesn't already exist
+  if tmux has-session -t "$name" 2>/dev/null; then
+    echo "✗ Session '$name' already exists. Use: go $name"
+    return 1
+  fi
 
-  # Add to start-projects.sh automatically
+  # Check path doesn't already exist
+  if [ -d "$path" ]; then
+    echo "✗ Path already exists: $path"
+    echo "  If you want to create a session for it, add it to start-projects.sh"
+    return 1
+  fi
+
+  echo "Cloning $repo → $path"
+  git clone "git@github.com:$repo.git" "$path" || {
+    echo "✗ Clone failed"
+    return 1
+  }
+
+  # Strip any local git identity — global config handles this
+  git -C "$path" config --unset user.name 2>/dev/null || true
+  git -C "$path" config --unset user.email 2>/dev/null || true
+
+  # Add to start-projects.sh so it persists across reboots
   sed -i "/^)/i\\  \"$name:$path\"" ~/start-projects.sh
 
-  # Create tmux session
+  # Create tmux session ──────────────────────────────────────────
   tmux new-session -d -s "$name" -c "$path" -x 220 -y 50
-  tmux rename-window -t "$name" "main"
-  tmux split-window -t "$name:main" -v -l 10 -c "$path"
-  tmux split-window -t "$name:main.1" -h -c "$path"
-  tmux select-pane -t "$name:main.0" -T "claude"
-  tmux select-pane -t "$name:main.1" -T "frontend"
-  tmux select-pane -t "$name:main.2" -T "backend"
-  tmux send-keys -t "$name:main.0" "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
-  sleep 3
-  tmux send-keys -t "$name:main.0" "y" Enter
-  tmux send-keys -t "$name:main.1" "" ""
-  tmux send-keys -t "$name:main.2" "" ""
 
-  echo "✓ $name is ready. Run: rc $name"
+  # Window 0: claude
+  tmux rename-window -t "$name:0" "claude"
+  tmux send-keys -t "$name:claude" \
+    "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
+  sleep 3
+  tmux send-keys -t "$name:claude" "y" Enter
+
+  # Window 1: shell
+  tmux new-window -t "$name" -n "shell" -c "$path"
+  tmux send-keys -t "$name:shell" "git status" Enter
+
+  # Return to claude window
+  tmux select-window -t "$name:claude"
+
+  echo ""
+  echo "✓ $name is ready"
+  echo ""
+  echo "  rc $name    — point remote control here"
+  echo "  go $name    — attach terminal"
+  echo ""
+  echo "  To add frontend/backend servers, edit ~/start-projects.sh:"
+  echo "    FRONTEND_CMD[\"$name\"]=\"npm run dev\""
+  echo "    BACKEND_CMD[\"$name\"]=\"uvicorn main:app --reload\""
+  echo "  Then: restart $name"
 }
 
-# ─── Local machine additions (add to ~/.zshrc) ────────────────────
+# ─── Local machine only (add to ~/.zshrc on Mac/Windows) ──────────
 
-# SSH tunnel to forward a VM port to localhost
+# Forward a single VM port to localhost
 # Usage: tunnel 5173
 tunnel() {
+  if [ -z "$1" ]; then
+    echo "Usage: tunnel <port>"
+    return 1
+  fi
+  echo "Tunnelling :${1} → localhost:${1}  (Ctrl+C to stop)"
   ssh -L ${1}:localhost:${1} -N cloud-dev
+}
+
+# Forward multiple VM ports to localhost simultaneously
+# Usage: tunnels 3000 8000 5173
+tunnels() {
+  if [ -z "$1" ]; then
+    echo "Usage: tunnels <port1> <port2> ..."
+    return 1
+  fi
+  local args=""
+  for port in "$@"; do
+    args="$args -L ${port}:localhost:${port}"
+  done
+  echo "Tunnelling ports [$@] → localhost  (Ctrl+C to stop)"
+  ssh $args -N cloud-dev
 }

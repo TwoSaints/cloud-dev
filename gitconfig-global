@@ -1,0 +1,21 @@
+[user]
+  name = MDS
+  email = michaeljamesds@gmail.com
+
+[init]
+  defaultBranch = main
+
+[pull]
+  rebase = false
+
+[user]
+  useConfigOnly = true
+
+[includeIf "gitdir:~/projects/velais/"]
+  path = ~/.gitconfig-velais
+
+[includeIf "gitdir:~/projects/velais/client/"]
+  path = ~/.gitconfig-velais
+
+[includeIf "gitdir:~/projects/m2/"]
+  path = ~/.gitconfig-velais
