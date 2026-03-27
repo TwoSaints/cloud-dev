@@ -1,0 +1,604 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════════
+# dev — Local entrypoint for cloud-dev remote development
+# ═══════════════════════════════════════════════════════════════════
+#
+# Opens terminal sessions connected to tmux sessions on the VM.
+# Works on Windows 10+ (Windows Terminal + Git Bash) and macOS
+# (iTerm2 / Terminal.app).
+#
+# Usage:
+#   dev                       Interactive session picker
+#   dev <name>                Attach to a specific session
+#   dev ls                    List active sessions on the VM
+#   dev open [names...]       Open sessions as tabs (all if no names)
+#   dev open -g [names...]    Open sessions in a tiled grid
+#   dev tunnel <port> [...]   Forward port(s) from VM to localhost
+#   dev help                  Show this help
+#
+# Once attached, each tmux session has:
+#   Ctrl+B 0  claude      Ctrl+B 2  frontend (if configured)
+#   Ctrl+B 1  shell       Ctrl+B 3  backend  (if configured)
+#   Ctrl+B D  detach
+#
+# Install:
+#   Windows:  copy to ~/bin/ (add to PATH) or source as alias
+#   macOS:    cp dev /usr/local/bin/dev && chmod +x /usr/local/bin/dev
+#
+# ═══════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+SSH_HOST="cloud-dev"
+
+# ── Helpers ──────────────────────────────────────────────────────
+
+die() { echo "✗ $*" >&2; exit 1; }
+
+detect_os() {
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) echo "windows" ;;
+    Darwin)               echo "macos" ;;
+    *)                    echo "linux" ;;
+  esac
+}
+
+OS=$(detect_os)
+
+# On Windows, Git Bash's SSH can't reach the Windows SSH agent named pipe.
+# Use the Windows OpenSSH binaries directly.
+if [ "$OS" = "windows" ]; then
+  SSH_CMD="/c/Windows/System32/OpenSSH/ssh.exe"
+  # Native Windows path for use in wt.exe subprocesses (which don't understand /c/ paths)
+  SSH_CMD_WIN="C:\\Windows\\System32\\OpenSSH\\ssh.exe"
+else
+  SSH_CMD="ssh"
+  SSH_CMD_WIN=""
+fi
+
+get_sessions() {
+  $SSH_CMD -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" \
+    "tmux ls -F '#{session_name}'" 2>/dev/null || true
+}
+
+# Get session names with their group colors (format: "name:color" per line)
+get_session_meta() {
+  $SSH_CMD -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" \
+    'for s in $(tmux ls -F "#{session_name}"); do
+      color=$(tmux show -t "$s" -v @color 2>/dev/null)
+      echo "$s:${color:-#c8a96e}"
+    done' 2>/dev/null || true
+}
+
+# Group display order (consistent tab/pane positioning)
+GROUP_ORDER=("velais" "personal" "m2" "system")
+
+# Group → Windows Terminal color scheme name (for grid pane tinting)
+declare -A GROUP_SCHEME
+GROUP_SCHEME["velais"]="Terra-Velais"
+GROUP_SCHEME["personal"]="Terra-Personal"
+GROUP_SCHEME["m2"]="Terra-M2"
+GROUP_SCHEME["system"]="Terra-System"
+
+# Reverse lookup: color hex → group name
+_color_to_group() {
+  case "$1" in
+    "#6b9bc0") echo "velais" ;;
+    "#7a8c5e") echo "personal" ;;
+    "#c8a96e") echo "m2" ;;
+    "#917068") echo "system" ;;
+    *)         echo "system" ;;
+  esac
+}
+
+# Sort session names by group order
+_sort_sessions() {
+  local meta="$1"
+  for group in "${GROUP_ORDER[@]}"; do
+    while IFS=: read -r name color; do
+      [ -z "$name" ] && continue
+      local g=$(_color_to_group "$color")
+      [ "$g" = "$group" ] && echo "$name"
+    done <<< "$meta"
+  done
+}
+
+# Resolve session list: specific names if given, otherwise all
+resolve_sessions() {
+  local sessions_raw
+  sessions_raw=$(get_sessions)
+  [ -z "$sessions_raw" ] && die "No sessions running on $SSH_HOST"
+
+  if [ $# -gt 0 ]; then
+    # Validate requested names exist
+    for name in "$@"; do
+      echo "$sessions_raw" | grep -qx "$name" \
+        || die "Session '$name' not found. Run: dev ls"
+    done
+    printf '%s\n' "$@"
+  else
+    echo "$sessions_raw"
+  fi
+}
+
+# ── Commands ─────────────────────────────────────────────────────
+
+cmd_help() {
+  cat << 'EOF'
+dev — cloud-dev remote development
+
+Commands:
+  dev                       Pick a session interactively
+  dev <name>                Attach to a session
+  dev ls                    List sessions (grouped by org)
+  dev open                  Open all sessions as tabs
+  dev open -g               Open all sessions in a tiled grid
+  dev open <n1> <n2> ...    Open specific sessions only
+  dev open -g <n1> <n2>     Grid with specific sessions only
+  dev tunnel <port> [...]   Forward port(s) to localhost
+  dev help                  This help
+
+Inside a session:
+  Ctrl+B 0        main window (claude + servers)
+  Ctrl+B 1        shell (git, manual commands)
+  Ctrl+B D        detach (session keeps running)
+  Ctrl+B [        copy mode (scroll with j/k, Ctrl+U/D)
+  Alt+Shift+P     zoom/unzoom pane (grid mode)
+
+Adding a repo (on the VM):
+  newproject <org>/<repo> <folder>
+  e.g. newproject velais-ai-solutions/new-repo velais/client
+  Sessions auto-appear in dev open on next run.
+
+Removing a repo (on the VM):
+  tmux kill-session -t <name>
+  Then remove its entry from ~/start-projects.sh
+
+Port forwarding:
+  dev tunnel 5173           single port
+  dev tunnel 3000 5173 8000 multiple ports
+  Then open http://localhost:<port> in your browser
+EOF
+}
+
+cmd_ls() {
+  local meta
+  meta=$(get_session_meta)
+  [ -z "$meta" ] && die "No sessions running on $SSH_HOST"
+
+  # Group sessions by their color (which maps to org)
+  echo "Sessions on $SSH_HOST:"
+  echo ""
+
+  local current_group=""
+  # Sort by color to group them, then display
+  echo "$meta" | sort -t: -k2 | while IFS=: read -r name color; do
+    if [ "$color" != "$current_group" ]; then
+      current_group="$color"
+      # Reverse-lookup group name from color
+      local group="other"
+      case "$color" in
+        "#6b9bc0") group="velais" ;;
+        "#7a8c5e") group="personal" ;;
+        "#c8a96e") group="m2" ;;
+        "#917068") group="system" ;;
+      esac
+      echo "  [$group]"
+    fi
+    echo "    $name"
+  done
+  echo ""
+}
+
+cmd_attach() {
+  exec $SSH_CMD "$SSH_HOST" -t "tmux select-window -t '$1':main 2>/dev/null || true && tmux attach -t '$1'"
+}
+
+cmd_tunnel() {
+  [ $# -eq 0 ] && die "Usage: dev tunnel <port> [port...]"
+  local args=""
+  for port in "$@"; do
+    args="$args -L ${port}:localhost:${port}"
+  done
+  echo "Tunnelling [$*] → localhost  (Ctrl+C to stop)"
+  # shellcheck disable=SC2086
+  exec $SSH_CMD $args -N "$SSH_HOST"
+}
+
+cmd_pick() {
+  local sessions=("$@")
+  local n=${#sessions[@]}
+
+  echo "Sessions on $SSH_HOST:"
+  echo ""
+  for ((i = 0; i < n; i++)); do
+    echo "  $((i + 1))) ${sessions[$i]}"
+  done
+  echo ""
+  read -rp "Attach to (1-$n): " choice
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+    cmd_attach "${sessions[$((choice - 1))]}"
+  else
+    die "Invalid choice"
+  fi
+}
+
+# ── Windows Terminal: tabs ───────────────────────────────────────
+
+# Stagger interval (seconds) between SSH connections.
+# Without staggering, simultaneous SSH handshakes through the
+# 1Password agent pipe overwhelm Windows Terminal and cause hangs.
+WT_STAGGER=2
+
+wt_tabs() {
+  local sessions=("$@")
+
+  # First tab creates the window
+  local s="${sessions[0]}"
+  local color="${SESSION_COLOR[$s]:-#c8a96e}"
+  wt.exe --title "$s" --tabColor "$color" "$SSH_CMD_WIN" "$SSH_HOST" -t "tmux select-window -t $s:main 2>/dev/null || true && tmux attach -t $s"
+
+  # Add remaining tabs with staggered delay
+  for ((i = 1; i < ${#sessions[@]}; i++)); do
+    sleep $WT_STAGGER
+    s="${sessions[$i]}"
+    color="${SESSION_COLOR[$s]:-#c8a96e}"
+    wt.exe -w 0 new-tab --title "$s" --tabColor "$color" "$SSH_CMD_WIN" "$SSH_HOST" -t "tmux select-window -t $s:main 2>/dev/null || true && tmux attach -t $s"
+  done
+
+  echo "✓ Opened ${#sessions[@]} tabs in Windows Terminal"
+}
+
+# ── Windows Terminal: grid ───────────────────────────────────────
+#
+# Max 3 rows per column. Adds columns as needed.
+# Uses sequential wt.exe calls with sleep to stagger SSH connections.
+#
+#   3 sessions:  s1 | s2     6 sessions:  s1 | s4    7 sessions:  s1 | s4 | s6
+#                s2 | s3                  s2 | s5                 s2 | s5 | s7
+#                                         s3 | s6                 s3 |    |
+
+_split_frac() {
+  local k=$1 i=$2
+  awk "BEGIN { printf \"%.2f\", ($k - 1 - $i) / ($k - $i) }"
+}
+
+wt_grid() {
+  local sessions=("$@")
+  local n=${#sessions[@]}
+
+  [ "$n" -eq 1 ] && { wt_tabs "${sessions[@]}"; return; }
+  [ "$n" -gt 12 ] && {
+    echo "⚠ Grid supports up to 12 sessions. Opening as tabs instead."
+    wt_tabs "${sessions[@]}"
+    return
+  }
+
+  _scheme_for() {
+    local group="${SESSION_GROUP[$1]:-system}"
+    echo "${GROUP_SCHEME[$group]:-Terra}"
+  }
+
+  # Distribute sessions into columns (max 3 rows each)
+  local max_rows=3
+  local num_cols=$(( (n + max_rows - 1) / max_rows ))
+  local col_starts=()
+  local col_sizes=()
+  local idx=0
+  for ((c = 0; c < num_cols; c++)); do
+    col_starts+=("$idx")
+    local remaining=$((n - idx))
+    local remaining_cols=$((num_cols - c))
+    local col_size=$(( (remaining + remaining_cols - 1) / remaining_cols ))
+    col_sizes+=("$col_size")
+    idx=$((idx + col_size))
+  done
+
+  # ── Step 1: Create first pane (col 0, row 0) ──────────────────
+  local s="${sessions[0]}"
+  local scheme=$(_scheme_for "$s")
+  wt.exe --title "$s" --colorScheme "$scheme" "$SSH_CMD_WIN" "$SSH_HOST" -t "tmux select-window -t $s:main 2>/dev/null || true && tmux attach -t $s"
+
+  # ── Step 2: Create remaining columns (split right) ────────────
+  # After this, each column is one pane. Focus ends on last column.
+  for ((c = 1; c < num_cols; c++)); do
+    sleep $WT_STAGGER
+    local ci="${col_starts[$c]}"
+    s="${sessions[$ci]}"
+    scheme=$(_scheme_for "$s")
+    local frac
+    frac=$(_split_frac "$num_cols" "$((c - 1))")
+    wt.exe -w 0 sp -V -s "$frac" --title "$s" --colorScheme "$scheme" "$SSH_CMD_WIN" "$SSH_HOST" -t "tmux select-window -t $s:main 2>/dev/null || true && tmux attach -t $s"
+  done
+
+  # ── Step 3: Split each column into rows (right to left) ───────
+  # Process right-to-left: each unsplit column to the left is still
+  # a single pane, so move-focus left always lands correctly.
+  for ((c = num_cols - 1; c >= 0; c--)); do
+    local csize="${col_sizes[$c]}"
+    local ci="${col_starts[$c]}"
+
+    [ "$csize" -le 1 ] && continue
+
+    # Move focus left to reach this column (1 move per column gap)
+    if [ "$c" -lt $((num_cols - 1)) ]; then
+      wt.exe -w 0 mf left
+    fi
+
+    # Split this column into rows
+    for ((r = 1; r < csize; r++)); do
+      sleep $WT_STAGGER
+      s="${sessions[$((ci + r))]}"
+      scheme=$(_scheme_for "$s")
+      local frac
+      frac=$(_split_frac "$csize" "$((r - 1))")
+      wt.exe -w 0 sp -H -s "$frac" --title "$s" --colorScheme "$scheme" "$SSH_CMD_WIN" "$SSH_HOST" -t "tmux select-window -t $s:main 2>/dev/null || true && tmux attach -t $s"
+    done
+  done
+
+  echo "✓ Opened $n sessions in grid ($num_cols columns)"
+  echo ""
+  echo "  Alt+Arrow        move between panes"
+  echo "  Alt+Shift+Arrow  resize panes"
+}
+
+# ── macOS: tabs ──────────────────────────────────────────────────
+
+mac_tabs() {
+  local sessions=("$@")
+
+  if [ -d "/Applications/iTerm.app" ]; then
+    _iterm_tabs "${sessions[@]}"
+  else
+    _terminal_tabs "${sessions[@]}"
+  fi
+}
+
+_iterm_profile_for() {
+  local group="${SESSION_GROUP[$1]:-system}"
+  echo "${GROUP_SCHEME[$group]:-Terra}"
+}
+
+_iterm_tabs() {
+  local sessions=("$@")
+  local cmds=""
+  local first_profile=$(_iterm_profile_for "${sessions[0]}")
+
+  for ((i = 0; i < ${#sessions[@]}; i++)); do
+    local s="${sessions[$i]}"
+    local profile=$(_iterm_profile_for "$s")
+    if [ "$i" -eq 0 ]; then
+      cmds="$cmds
+    tell current session of current tab
+      write text \"$SSH_CMD $SSH_HOST -t 'tmux select-window -t $s:main 2>/dev/null || true && tmux attach -t $s'\"
+    end tell"
+    else
+      cmds="$cmds
+    set newTab to (create tab with profile \"$profile\")
+    tell current session of newTab
+      write text \"$SSH_CMD $SSH_HOST -t 'tmux select-window -t $s:main 2>/dev/null || true && tmux attach -t $s'\"
+    end tell"
+    fi
+  done
+
+  osascript <<EOF
+tell application "iTerm"
+  activate
+  set newWindow to (create window with profile "$first_profile")
+  tell newWindow$cmds
+  end tell
+end tell
+EOF
+  echo "✓ Opened ${#sessions[@]} tabs in iTerm2"
+}
+
+_terminal_tabs() {
+  local sessions=("$@")
+  local cmds=""
+
+  # First tab uses the frontmost window
+  cmds="do script \"$SSH_CMD $SSH_HOST -t 'tmux select-window -t ${sessions[0]}:main 2>/dev/null || true && tmux attach -t ${sessions[0]}'\""
+
+  for ((i = 1; i < ${#sessions[@]}; i++)); do
+    local s="${sessions[$i]}"
+    cmds="$cmds
+  tell application \"System Events\" to keystroke \"t\" using command down
+  delay 0.3
+  do script \"$SSH_CMD $SSH_HOST -t 'tmux select-window -t $s:main 2>/dev/null || true && tmux attach -t $s'\" in front window"
+  done
+
+  osascript <<EOF
+tell application "Terminal"
+  activate
+  $cmds
+end tell
+EOF
+  echo "✓ Opened ${#sessions[@]} tabs in Terminal.app"
+}
+
+# ── macOS: grid ──────────────────────────────────────────────────
+
+mac_grid() {
+  local sessions=("$@")
+
+  if [ -d "/Applications/iTerm.app" ]; then
+    _iterm_grid "${sessions[@]}"
+  else
+    # Terminal.app: open separate windows, user tiles manually
+    for s in "${sessions[@]}"; do
+      osascript -e "tell application \"Terminal\" to do script \"$SSH_CMD $SSH_HOST -t 'tmux select-window -t $s:main 2>/dev/null || true && tmux attach -t $s'\""
+    done
+    echo "✓ Opened ${#sessions[@]} windows — tile with Rectangle or ⌃⌘+Arrow"
+  fi
+}
+
+_iterm_grid() {
+  local sessions=("$@")
+  local n=${#sessions[@]}
+
+  [ "$n" -eq 1 ] && { _iterm_tabs "${sessions[@]}"; return; }
+
+  # iTerm2: create one window, split into grid with per-pane profiles
+  local left_n=$(( (n + 1) / 2 ))
+  local left=("${sessions[@]:0:$left_n}")
+  local right=("${sessions[@]:$left_n}")
+
+  local first_profile=$(_iterm_profile_for "${left[0]}")
+
+  local script="tell application \"iTerm\"
+  activate
+  set w to (create window with profile \"$first_profile\")
+  tell w
+    tell current session of current tab
+      write text \"$SSH_CMD $SSH_HOST -t 'tmux select-window -t ${left[0]}:main 2>/dev/null || true && tmux attach -t ${left[0]}'\"
+"
+  # Split right column
+  if [ ${#right[@]} -gt 0 ]; then
+    local rp=$(_iterm_profile_for "${right[0]}")
+    script="$script      set rightPane to (split vertically with profile \"$rp\")
+      tell rightPane
+        write text \"$SSH_CMD $SSH_HOST -t 'tmux select-window -t ${right[0]}:main 2>/dev/null || true && tmux attach -t ${right[0]}'\"
+      end tell
+"
+  fi
+
+  # Additional rows in right column
+  for ((i = 1; i < ${#right[@]}; i++)); do
+    local rp=$(_iterm_profile_for "${right[$i]}")
+    script="$script      tell rightPane
+        set rightPane to (split horizontally with profile \"$rp\")
+        write text \"$SSH_CMD $SSH_HOST -t 'tmux select-window -t ${right[$i]}:main 2>/dev/null || true && tmux attach -t ${right[$i]}'\"
+      end tell
+"
+  done
+
+  # Additional rows in left column
+  for ((i = 1; i < ${#left[@]}; i++)); do
+    local lp=$(_iterm_profile_for "${left[$i]}")
+    if [ "$i" -eq 1 ]; then
+      script="$script      set leftPane to (split horizontally with profile \"$lp\")
+      tell leftPane
+        write text \"$SSH_CMD $SSH_HOST -t 'tmux select-window -t ${left[$i]}:main 2>/dev/null || true && tmux attach -t ${left[$i]}'\"
+      end tell
+"
+    else
+      script="$script      tell leftPane
+        set leftPane to (split horizontally with profile \"$lp\")
+        write text \"$SSH_CMD $SSH_HOST -t 'tmux select-window -t ${left[$i]}:main 2>/dev/null || true && tmux attach -t ${left[$i]}'\"
+      end tell
+"
+    fi
+  done
+
+  script="$script    end tell
+  end tell
+end tell"
+
+  osascript -e "$script"
+  echo "✓ Opened $n sessions in iTerm2 grid"
+}
+
+# ── Main ─────────────────────────────────────────────────────────
+
+main() {
+  case "${1:-}" in
+    help|-h|--help)
+      cmd_help
+      ;;
+    ls|list)
+      cmd_ls
+      ;;
+    tunnel)
+      shift
+      cmd_tunnel "$@"
+      ;;
+    open)
+      shift
+      local grid=false
+      local names=()
+
+      # Parse flags and session names
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -g|--grid) grid=true ;;
+          *)         names+=("$1") ;;
+        esac
+        shift
+      done
+
+      # Fetch session metadata (names + group colors)
+      declare -A SESSION_COLOR
+      declare -A SESSION_GROUP
+      local meta
+      meta=$(get_session_meta)
+      [ -z "$meta" ] && die "No sessions running on $SSH_HOST"
+
+      while IFS=: read -r sname scolor; do
+        if [ -n "$sname" ]; then
+          SESSION_COLOR["$sname"]="$scolor"
+          SESSION_GROUP["$sname"]=$(_color_to_group "$scolor")
+        fi
+      done <<< "$meta"
+
+      # Resolve which sessions to open (sorted by group order)
+      local sessions=()
+      if [ ${#names[@]} -gt 0 ]; then
+        # Specific names requested — validate then sort
+        for name in "${names[@]}"; do
+          [ -z "${SESSION_COLOR[$name]+x}" ] && die "Session '$name' not found. Run: dev ls"
+        done
+        # Build mini-meta for just the requested names and sort
+        local mini_meta=""
+        for name in "${names[@]}"; do
+          mini_meta+="$name:${SESSION_COLOR[$name]}"$'\n'
+        done
+        while IFS= read -r sname; do
+          [ -n "$sname" ] && sessions+=("$sname")
+        done < <(_sort_sessions "$mini_meta")
+      else
+        while IFS= read -r sname; do
+          [ -n "$sname" ] && sessions+=("$sname")
+        done < <(_sort_sessions "$meta")
+      fi
+
+      echo "Opening ${#sessions[@]} sessions..."
+      echo ""
+
+      if $grid; then
+        case "$OS" in
+          windows) wt_grid "${sessions[@]}" ;;
+          macos)   mac_grid "${sessions[@]}" ;;
+          *)       die "Grid not supported on this platform. Use: dev <name>" ;;
+        esac
+      else
+        case "$OS" in
+          windows) wt_tabs "${sessions[@]}" ;;
+          macos)   mac_tabs "${sessions[@]}" ;;
+          *)       die "Open not supported on this platform. Use: dev <name>" ;;
+        esac
+      fi
+      ;;
+    "")
+      # No args — interactive picker
+      local sessions=()
+      while IFS= read -r s; do
+        [ -n "$s" ] && sessions+=("$s")
+      done < <(get_sessions)
+
+      [ ${#sessions[@]} -eq 0 ] && die "No sessions running on $SSH_HOST"
+
+      if [ ${#sessions[@]} -eq 1 ]; then
+        cmd_attach "${sessions[0]}"
+      else
+        cmd_pick "${sessions[@]}"
+      fi
+      ;;
+    *)
+      # Treat as session name
+      cmd_attach "$1"
+      ;;
+  esac
+}
+
+main "$@"

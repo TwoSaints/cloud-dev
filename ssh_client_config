@@ -1,8 +1,16 @@
 # ─── Local machine ~/.ssh/config ─────────────────────────────────
 # Add this to ~/.ssh/config on your local machine
+#
+# ControlMaster reuses one TCP connection for all SSH sessions.
+# On macOS/Linux this makes 2nd+ connections instant.
+# On Windows, ControlMaster is not supported — omit those lines.
 
 Host cloud-dev
   HostName 46.62.212.195
   User mds
   ServerAliveInterval 60
   ServerAliveCountMax 10
+  # macOS/Linux only (remove on Windows):
+  ControlMaster auto
+  ControlPath ~/.ssh/sockets/%r@%h-%p
+  ControlPersist 600
