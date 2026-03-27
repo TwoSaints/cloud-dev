@@ -179,6 +179,197 @@ process_newproject() {
   fi
 }
 
+# ── Plan flow (phone-based) ───────────────────────────────────────
+
+PLAN_STATE_FILE="$HOME/.gsd-plan-state"
+
+# Find the next repo needing human input (milestone or discussion)
+# Output: "session|path|status|phase" or empty
+find_next_plan_target() {
+  for s in $(tmux ls -F "#{session_name}" 2>/dev/null); do
+    [ "$s" = "gsd-queue" ] || [ "$s" = "gsd-ideas" ] && continue
+    local path
+    path=$(tmux display-message -t "$s:shell" -p "#{pane_current_path}" 2>/dev/null || \
+           tmux display-message -t "$s:main.0" -p "#{pane_current_path}" 2>/dev/null)
+    [ -z "$path" ] || [ ! -d "$path/.planning" ] && continue
+
+    # Check for pending backlog (needs milestone)
+    local phases_dir="$path/.planning/phases"
+    [ ! -d "$phases_dir" ] && phases_dir=$(find "$path/.planning/milestones" -maxdepth 2 -name "*phases" -type d 2>/dev/null | head -1)
+
+    local all_done=true
+    if [ -n "$phases_dir" ]; then
+      for phase_dir in $(ls -d "$phases_dir"/*/ 2>/dev/null | sort); do
+        local phase_num
+        phase_num=$(basename "$phase_dir" | grep -oP '^\d+')
+        [ -z "$phase_num" ] && continue
+        [ -n "$(find "$phase_dir" -name "*VERIFICATION*" 2>/dev/null | head -1)" ] && continue
+
+        local ctx
+        ctx=$(find "$phase_dir" -name "*CONTEXT*" 2>/dev/null | head -1)
+        if [ -z "$ctx" ]; then
+          echo "$s|$path|discussion|$phase_num"
+          return
+        fi
+        all_done=false
+        break
+      done
+    fi
+
+    if $all_done; then
+      local has_backlog
+      has_backlog=$(find "$path/.planning/todos/pending" -name "*.md" 2>/dev/null | head -1)
+      if [ -n "$has_backlog" ]; then
+        echo "$s|$path|milestone|0"
+        return
+      fi
+    fi
+  done
+}
+
+process_plan() {
+  log "PLAN: scanning for next repo needing attention"
+
+  local target
+  target=$(find_next_plan_target)
+
+  if [ -z "$target" ]; then
+    notify "No repos need planning right now. All clear!" "white_check_mark"
+    return
+  fi
+
+  local session path status phase
+  IFS='|' read -r session path status phase <<< "$target"
+
+  # Save state so plan-next knows where we are
+  echo "$session|$path|$status|$phase" > "$PLAN_STATE_FILE"
+
+  # Source bashrc for rc function
+  source "$HOME/.bashrc" 2>/dev/null
+
+  # Start remote-control in this repo
+  log "PLAN: starting remote-control in $session ($status, phase $phase)"
+
+  tmux send-keys -t "$session:main.0" C-c C-c 2>/dev/null
+  sleep 1
+  tmux send-keys -t "$session:main.0" \
+    "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
+  sleep 3
+  tmux send-keys -t "$session:main.0" "y" Enter
+
+  if [ "$status" = "milestone" ]; then
+    notify "Ready: $session needs a new milestone\n\nOpen Claude app and run:\n/gsd:new-milestone" "star"
+  else
+    notify "Ready: $session Phase $phase\n\nOpen Claude app and run:\n/gsd:discuss-phase $phase" "speech_balloon"
+  fi
+}
+
+process_plan_next() {
+  log "PLAN-NEXT: moving to next repo"
+
+  # Stop remote-control in current repo
+  if [ -f "$PLAN_STATE_FILE" ]; then
+    local prev_session
+    prev_session=$(cat "$PLAN_STATE_FILE" | cut -d'|' -f1)
+    if [ -n "$prev_session" ]; then
+      tmux send-keys -t "$prev_session:main.0" C-c C-c 2>/dev/null
+      sleep 1
+      log "PLAN-NEXT: stopped remote-control in $prev_session"
+    fi
+  fi
+
+  # Find next target
+  local target
+  target=$(find_next_plan_target)
+
+  if [ -z "$target" ]; then
+    rm -f "$PLAN_STATE_FILE"
+    notify "All planning complete! Send '4897:launch' to start autonomous execution." "tada"
+    return
+  fi
+
+  local session path status phase
+  IFS='|' read -r session path status phase <<< "$target"
+
+  echo "$session|$path|$status|$phase" > "$PLAN_STATE_FILE"
+
+  tmux send-keys -t "$session:main.0" C-c C-c 2>/dev/null
+  sleep 1
+  tmux send-keys -t "$session:main.0" \
+    "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
+  sleep 3
+  tmux send-keys -t "$session:main.0" "y" Enter
+
+  if [ "$status" = "milestone" ]; then
+    notify "Next: $session needs a new milestone\n\nOpen Claude app and run:\n/gsd:new-milestone" "star"
+  else
+    notify "Next: $session Phase $phase\n\nOpen Claude app and run:\n/gsd:discuss-phase $phase" "speech_balloon"
+  fi
+}
+
+process_launch() {
+  log "LAUNCH: starting queue runner"
+
+  # Stop any active remote-control
+  if [ -f "$PLAN_STATE_FILE" ]; then
+    local prev_session
+    prev_session=$(cat "$PLAN_STATE_FILE" | cut -d'|' -f1)
+    if [ -n "$prev_session" ]; then
+      tmux send-keys -t "$prev_session:main.0" C-c C-c 2>/dev/null
+    fi
+    rm -f "$PLAN_STATE_FILE"
+  fi
+
+  # Check if queue runner is already running
+  if tmux has-session -t gsd-queue 2>/dev/null; then
+    notify "Queue runner already active. Send 'status' to check progress." "information_source"
+    return
+  fi
+
+  # Start the queue runner
+  tmux new-session -d -s gsd-queue -x 220 -y 50
+  tmux send-keys -t gsd-queue "$HOME/bin/gsd-queue-runner.sh" Enter
+
+  notify "Queue runner started. Autonomous execution in progress." "rocket"
+}
+
+process_status() {
+  log "STATUS: checking queue"
+
+  if ! tmux has-session -t gsd-queue 2>/dev/null; then
+    local target
+    target=$(find_next_plan_target)
+    if [ -n "$target" ]; then
+      local session status phase
+      IFS='|' read -r session _ status phase <<< "$target"
+      notify "Runner: stopped\nNext: $session ($status, phase $phase)\n\nSend 'plan' to start planning" "information_source"
+    else
+      notify "Runner: stopped\nNo pending work." "information_source"
+    fi
+    return
+  fi
+
+  # Read state file
+  if [ -f "$HOME/.gsd-queue-state" ]; then
+    local running=0 queued=0 done=0
+    local summary=""
+    while IFS='|' read -r name st phase; do
+      case "$st" in
+        running) ((running++)); summary="$summary\n▶ $name (phase $phase)" ;;
+        queued) ((queued++)) ;;
+        done) ((done++)) ;;
+      esac
+    done < <(grep '|' "$HOME/.gsd-queue-state")
+
+    local mem
+    mem=$(grep "^memory=" "$HOME/.gsd-queue-state" | cut -d= -f2)
+
+    notify "Running: $running | Queued: $queued | Done: $done\nMemory: $mem$summary" "bar_chart"
+  else
+    notify "Queue runner active but no state yet. Check again shortly." "hourglass"
+  fi
+}
+
 # ── Process a single message ─────────────────────────────────────
 
 process_message() {
@@ -234,11 +425,14 @@ print(f'{attach}')
     return 1
   }
 
-  # Route: if title is "newproject", clone a repo instead
-  if [ "$repo_name" = "newproject" ]; then
-    process_newproject "$body"
-    return
-  fi
+  # Route: special commands
+  case "$repo_name" in
+    newproject) process_newproject "$body"; return ;;
+    plan)       process_plan; return ;;
+    plan-next)  process_plan_next; return ;;
+    launch)     process_launch; return ;;
+    status)     process_status; return ;;
+  esac
 
   # Use first line of body as the todo title, rest as body
   local todo_title
