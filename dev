@@ -946,6 +946,7 @@ cmd_priority() {
 # ── dev idea ──────────────────────────────────────────────────────
 
 NTFY_IDEAS_TOPIC="mds-ideas-fb5bf625e6e1a4d2"
+IDEA_PIN="4897"
 
 cmd_idea() {
   if [ $# -lt 2 ]; then
@@ -955,35 +956,38 @@ cmd_idea() {
     echo ""
     echo "Or send from your phone via the Ntfy app:"
     echo "  Topic: $NTFY_IDEAS_TOPIC"
-    echo "  Title: repo name (e.g. todolisto)"
+    echo "  Title: $IDEA_PIN:<repo>  (e.g. $IDEA_PIN:todolisto)"
     echo "  Message: feature description"
+    echo ""
+    echo "To clone a new repo from phone:"
+    echo "  Title: $IDEA_PIN:newproject"
+    echo "  Message: org/repo folder"
     return 1
   fi
 
   local repo="$1"
   shift
 
+  local title="${IDEA_PIN}:${repo}"
+
   if [ "$1" = "--file" ] && [ -n "${2:-}" ]; then
-    # Send file contents
     local file="$2"
     [ ! -f "$file" ] && die "File not found: $file"
     local content
     content=$(cat "$file")
     curl -s --max-time 10 \
-      -H "Title: $repo" \
+      -H "Title: $title" \
       --data-raw "$content" \
       "https://ntfy.sh/$NTFY_IDEAS_TOPIC" > /dev/null 2>&1
   else
-    # Send inline text
     local text="$*"
     curl -s --max-time 10 \
-      -H "Title: $repo" \
+      -H "Title: $title" \
       --data-raw "$text" \
       "https://ntfy.sh/$NTFY_IDEAS_TOPIC" > /dev/null 2>&1
   fi
 
   echo "✓ Idea sent to $repo"
-  echo "  (Listener will create the backlog item and confirm via notification)"
 }
 
 # ── dev ideas ─────────────────────────────────────────────────────

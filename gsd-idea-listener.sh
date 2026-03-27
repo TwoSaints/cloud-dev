@@ -25,6 +25,7 @@ mkdir -p "$HOME/logs"
 
 NTFY_IDEAS_TOPIC="mds-ideas-fb5bf625e6e1a4d2"
 NTFY_NOTIFY_TOPIC="mds-cloud-dev-791a67ce61aaa1fe"
+IDEA_PIN=""  # set in ~/.gsd-queue.conf
 
 [ -f "$CONF_FILE" ] && source "$CONF_FILE"
 
@@ -131,6 +132,53 @@ ATTACHEOF
   return 0
 }
 
+# ── Clone a new repo ─────────────────────────────────────────────
+
+process_newproject() {
+  local body="$1"
+
+  # Parse: "org/repo folder"
+  local repo folder
+  repo=$(echo "$body" | awk '{print $1}')
+  folder=$(echo "$body" | awk '{print $2}')
+
+  if [ -z "$repo" ] || [ -z "$folder" ]; then
+    log "ERROR: newproject needs 'org/repo folder'"
+    notify "New project rejected — format: org/repo folder\ne.g. TwoSaints/my-app personal" "x"
+    return 1
+  fi
+
+  log "Cloning new project: $repo → $folder"
+  notify "Cloning $repo..." "hourglass"
+
+  # Source bashrc to get the newproject function
+  source "$HOME/.bashrc" 2>/dev/null
+
+  # Run newproject (defined in bashrc_additions)
+  if newproject "$repo" "$folder" >> "$LOG" 2>&1; then
+    local name
+    name=$(basename "$repo")
+
+    # Apply group colour
+    local path="$HOME/projects/$folder/$name"
+    local group="system" color="#917068"
+    case "$path" in
+      */projects/personal/*) group="personal" color="#7a8c5e" ;;
+      */projects/velais/*)   group="velais"   color="#6b9bc0" ;;
+      */projects/m2/*)       group="m2"       color="#c8a96e" ;;
+    esac
+    tmux set -t "$name" @group "$group" 2>/dev/null
+    tmux set -t "$name" @color "$color" 2>/dev/null
+    tmux set -t "$name" status-left "#[fg=$color,bold] $name #[fg=#3d3226]│ " 2>/dev/null
+
+    log "Project created: $name ($group)"
+    notify "Project $name is ready\ngo $name — attach\ndev open — see all sessions" "white_check_mark"
+  else
+    log "ERROR: newproject failed for $repo"
+    notify "Failed to clone $repo — check logs" "x"
+  fi
+}
+
 # ── Process a single message ─────────────────────────────────────
 
 process_message() {
@@ -154,7 +202,7 @@ if not title and ':' in body.split('\n')[0]:
     body = ':'.join(first_line.split(':')[1:]).strip() + '\n' + '\n'.join(body.split('\n')[1:])
     body = body.strip()
 
-# Title is the repo name, body is the description
+# Title is the repo name (possibly with PIN prefix)
 print(f'{title}')
 print(f'---SPLIT---')
 print(f'{body}')
@@ -162,8 +210,21 @@ print(f'---SPLIT---')
 print(f'{attach}')
 " "$json" 2>/dev/null) || return 1
 
-  local repo_name title_line body attachment_url
-  repo_name=$(echo "$parsed" | head -1)
+  local raw_title body attachment_url
+  raw_title=$(echo "$parsed" | head -1)
+
+  # ── PIN validation ───────────────────────────────────────────
+  local repo_name="$raw_title"
+  if [ -n "$IDEA_PIN" ]; then
+    # Expect format: PIN:repo_name
+    local msg_pin="${raw_title%%:*}"
+    if [ "$msg_pin" != "$IDEA_PIN" ]; then
+      log "REJECTED: invalid PIN in title '$raw_title'"
+      return 1
+    fi
+    repo_name="${raw_title#*:}"
+    repo_name=$(echo "$repo_name" | tr -d '[:space:]')
+  fi
   body=$(echo "$parsed" | sed -n '/^---SPLIT---$/,/^---SPLIT---$/p' | sed '1d;$d')
   attachment_url=$(echo "$parsed" | tail -1)
 
@@ -172,6 +233,12 @@ print(f'{attach}')
     notify "Idea rejected — set the title to the repo name (e.g. 'todolisto')" "x"
     return 1
   }
+
+  # Route: if title is "newproject", clone a repo instead
+  if [ "$repo_name" = "newproject" ]; then
+    process_newproject "$body"
+    return
+  fi
 
   # Use first line of body as the todo title, rest as body
   local todo_title
