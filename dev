@@ -127,7 +127,7 @@ cmd_help() {
   cat << 'EOF'
 dev — cloud-dev remote development
 
-Commands:
+Sessions:
   dev                       Pick a session interactively
   dev <name>                Attach to a session
   dev ls                    List sessions (grouped by org)
@@ -136,7 +136,13 @@ Commands:
   dev open <n1> <n2> ...    Open specific sessions only
   dev open -g <n1> <n2>     Grid with specific sessions only
   dev tunnel <port> [...]   Forward port(s) to localhost
-  dev help                  This help
+
+GSD workflow:
+  dev plan                  Batch discussions — answer planning questions
+  dev launch                Start autonomous execution queue
+  dev status                Show queue progress
+  dev verify                Batch review completed work
+  dev priority <repos...>   Set execution priority order
 
 Inside a session:
   Ctrl+B 0        main window (claude + servers)
@@ -145,19 +151,19 @@ Inside a session:
   Ctrl+B [        copy mode (scroll with j/k, Ctrl+U/D)
   Alt+Shift+P     zoom/unzoom pane (grid mode)
 
+Typical workflow:
+  dev plan        → do all discussions in one sitting
+  dev launch      → Claude executes autonomously (queue managed)
+  dev status      → check progress anytime
+  dev verify      → review completed work when ready
+
 Adding a repo (on the VM):
   newproject <org>/<repo> <folder>
-  e.g. newproject velais-ai-solutions/new-repo velais/client
-  Sessions auto-appear in dev open on next run.
+  Sessions auto-appear in dev commands on next run.
 
 Removing a repo (on the VM):
   tmux kill-session -t <name>
   Then remove its entry from ~/start-projects.sh
-
-Port forwarding:
-  dev tunnel 5173           single port
-  dev tunnel 3000 5173 8000 multiple ports
-  Then open http://localhost:<port> in your browser
 EOF
 }
 
@@ -499,6 +505,335 @@ end tell"
   echo "✓ Opened $n sessions in iTerm2 grid"
 }
 
+# ── GSD queue helpers ─────────────────────────────────────────────
+
+# Run a command on the VM with fnm/pyenv in PATH (interactive, with TTY)
+_vm_exec() {
+  $SSH_CMD "$SSH_HOST" -t "
+    export FNM_PATH=\"\$HOME/.local/share/fnm\"
+    export PATH=\"\$FNM_PATH:\$HOME/.pyenv/bin:\$HOME/.local/bin:\$HOME/bin:\$PATH\"
+    eval \"\$(fnm env 2>/dev/null)\"
+    eval \"\$(pyenv init - 2>/dev/null)\"
+    $1
+  "
+}
+
+# Run a command on the VM non-interactively (for data collection)
+_vm_batch() {
+  $SSH_CMD -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" "
+    export FNM_PATH=\"\$HOME/.local/share/fnm\"
+    export PATH=\"\$FNM_PATH:\$HOME/.pyenv/bin:\$HOME/.local/bin:\$HOME/bin:\$PATH\"
+    eval \"\$(fnm env 2>/dev/null)\"
+    eval \"\$(pyenv init - 2>/dev/null)\"
+    $1
+  "
+}
+
+# Scan repos for GSD status. Output: "session|path|gsd_status|phase" per line
+_vm_gsd_scan() {
+  _vm_batch '
+    for s in $(tmux ls -F "#{session_name}" 2>/dev/null); do
+      [ "$s" = "gsd-queue" ] && continue
+      path=$(tmux display-message -t "$s:shell" -p "#{pane_current_path}" 2>/dev/null || \
+             tmux display-message -t "$s:main.0" -p "#{pane_current_path}" 2>/dev/null)
+      [ -z "$path" ] && continue
+      [ ! -d "$path/.planning" ] && continue
+
+      phases_dir="$path/.planning/phases"
+      [ ! -d "$phases_dir" ] && phases_dir=$(find "$path/.planning/milestones" -maxdepth 2 -name "*phases" -type d 2>/dev/null | head -1)
+      [ -z "$phases_dir" ] && echo "$s|$path|done|0" && continue
+
+      found=false
+      for phase_dir in $(ls -d "$phases_dir"/*/ 2>/dev/null | sort); do
+        phase_num=$(basename "$phase_dir" | grep -oP "^\d+")
+        [ -z "$phase_num" ] && continue
+        [ -n "$(find "$phase_dir" -name "*VERIFICATION*" 2>/dev/null | head -1)" ] && continue
+
+        ctx=$(find "$phase_dir" -name "*CONTEXT*" 2>/dev/null | head -1)
+        pln=$(find "$phase_dir" -name "*PLAN*" 2>/dev/null | head -1)
+        smr=$(find "$phase_dir" -name "*SUMMARY*" 2>/dev/null | head -1)
+
+        if [ -z "$ctx" ]; then
+          echo "$s|$path|discussion|$phase_num"
+        elif [ -z "$pln" ]; then
+          echo "$s|$path|planning|$phase_num"
+        elif [ -z "$smr" ]; then
+          echo "$s|$path|execution|$phase_num"
+        else
+          echo "$s|$path|verify|$phase_num"
+        fi
+        found=true
+        break
+      done
+      $found || echo "$s|$path|done|0"
+    done
+  '
+}
+
+# ── dev plan ─────────────────────────────────────────────────────
+
+cmd_plan() {
+  echo "Scanning repos for GSD status..."
+  echo ""
+
+  local scan
+  scan=$(_vm_gsd_scan)
+  [ -z "$scan" ] && die "No repos with .planning/ found on $SSH_HOST"
+
+  # Categorise and display
+  local needs_discussion=()
+  local needs_discussion_paths=()
+  local needs_discussion_phases=()
+
+  while IFS='|' read -r session path status phase; do
+    [ -z "$session" ] && continue
+    case "$status" in
+      discussion)
+        needs_discussion+=("$session")
+        needs_discussion_paths+=("$path")
+        needs_discussion_phases+=("$phase")
+        echo "  ● $session — Phase $phase: needs discussion"
+        ;;
+      planning)  echo "  ○ $session — Phase $phase: ready to plan (autonomous)" ;;
+      execution) echo "  ○ $session — Phase $phase: ready to execute (autonomous)" ;;
+      verify)    echo "  ◇ $session — Phase $phase: needs verification" ;;
+      done)      echo "  ✓ $session — all phases complete" ;;
+    esac
+  done <<< "$scan"
+
+  echo ""
+
+  if [ ${#needs_discussion[@]} -eq 0 ]; then
+    echo "No repos need discussion. Run 'dev launch' to start autonomous execution."
+    return
+  fi
+
+  echo "${#needs_discussion[@]} repo(s) need your input."
+  echo ""
+  read -rp "Start discussions? (y/N): " choice
+  [ "$choice" != "y" ] && [ "$choice" != "Y" ] && return
+
+  for ((i = 0; i < ${#needs_discussion[@]}; i++)); do
+    local session="${needs_discussion[$i]}"
+    local path="${needs_discussion_paths[$i]}"
+    local phase="${needs_discussion_phases[$i]}"
+
+    echo ""
+    echo "━━━ $session · Phase $phase ━━━"
+    echo "Opening Claude Code. Run /gsd:discuss-phase $phase"
+    echo "Exit Claude (Ctrl+C, /exit) when done."
+    echo ""
+    read -rp "Press Enter to open $session..." _
+
+    _vm_exec "cd $path && claude --dangerously-skip-permissions"
+
+    echo ""
+    echo "✓ Done with $session"
+  done
+
+  echo ""
+  echo "All discussions complete."
+  read -rp "Launch autonomous execution? (y/N): " choice
+  if [ "$choice" = "y" ] || [ "$choice" = "Y" ]; then
+    cmd_launch
+  fi
+}
+
+# ── dev launch ───────────────────────────────────────────────────
+
+cmd_launch() {
+  # Check if runner is already active
+  local running
+  running=$($SSH_CMD -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" \
+    "tmux has-session -t gsd-queue 2>/dev/null && echo yes || echo no")
+
+  if [ "$running" = "yes" ]; then
+    echo "Queue runner is already active."
+    read -rp "Restart it? (y/N): " choice
+    if [ "$choice" = "y" ] || [ "$choice" = "Y" ]; then
+      $SSH_CMD -o BatchMode=yes "$SSH_HOST" "tmux kill-session -t gsd-queue 2>/dev/null" || true
+    else
+      echo "Use 'dev status' to check progress."
+      return
+    fi
+  fi
+
+  # Ensure runner script exists on VM
+  local has_runner
+  has_runner=$($SSH_CMD -o BatchMode=yes "$SSH_HOST" \
+    "[ -f ~/bin/gsd-queue-runner.sh ] && echo yes || echo no")
+
+  if [ "$has_runner" = "no" ]; then
+    echo "Installing queue runner on VM..."
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "$script_dir/gsd-queue-runner.sh" ]; then
+      $SSH_CMD "$SSH_HOST" "cat > ~/bin/gsd-queue-runner.sh && chmod +x ~/bin/gsd-queue-runner.sh" \
+        < "$script_dir/gsd-queue-runner.sh"
+    else
+      die "gsd-queue-runner.sh not found in $script_dir"
+    fi
+  fi
+
+  # Launch the runner in its own tmux session
+  $SSH_CMD -o BatchMode=yes "$SSH_HOST" "
+    tmux new-session -d -s gsd-queue -x 220 -y 50
+    tmux send-keys -t gsd-queue '~/bin/gsd-queue-runner.sh' Enter
+  "
+
+  echo ""
+  echo "✓ Queue runner started"
+  echo ""
+  echo "  dev status     check progress"
+  echo "  dev priority   change execution order"
+}
+
+# ── dev status ───────────────────────────────────────────────────
+
+cmd_status() {
+  local state
+  state=$($SSH_CMD -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" \
+    "cat ~/.gsd-queue-state 2>/dev/null") || true
+
+  if [ -z "$state" ]; then
+    echo "No queue state found. Run 'dev launch' first."
+    return
+  fi
+
+  local runner_alive
+  runner_alive=$($SSH_CMD -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" \
+    "tmux has-session -t gsd-queue 2>/dev/null && echo yes || echo no")
+
+  echo "GSD Queue"
+  echo "════════════════════════════════════════"
+
+  # Parse the state file (simple key=value + pipe-delimited lines)
+  local updated="" memory="" wip=""
+  local running_count=0 queued_count=0
+
+  while IFS= read -r line; do
+    case "$line" in
+      updated=*) updated="${line#updated=}" ;;
+      memory=*)  memory="${line#memory=}" ;;
+      wip_limit=*) wip="${line#wip_limit=}" ;;
+      running=*) running_count="${line#running=}" ;;
+      *"|"*)
+        IFS='|' read -r name status phase <<< "$line"
+        case "$status" in
+          running)      echo "  ▶ $name  phase $phase" ;;
+          queued)       echo "  ○ $name  phase $phase" ;;
+          rate-limited) echo "  ⏸ $name  phase $phase  (rate limited)" ;;
+          done)         echo "  ✓ $name" ;;
+          skipped)      echo "  - $name  phase $phase  (needs human input)" ;;
+        esac
+        ;;
+    esac
+  done <<< "$state"
+
+  echo ""
+  if [ "$runner_alive" = "yes" ]; then
+    echo "  Runner: active  |  WIP: $running_count/$wip  |  Memory: $memory"
+  else
+    echo "  Runner: stopped"
+  fi
+  echo "  Updated: $updated"
+}
+
+# ── dev verify ───────────────────────────────────────────────────
+
+cmd_verify() {
+  echo "Scanning for repos with unverified completed phases..."
+  echo ""
+
+  local scan
+  scan=$(_vm_gsd_scan)
+  [ -z "$scan" ] && die "No repos with .planning/ found"
+
+  local needs_verify=()
+  local verify_paths=()
+  local verify_phases=()
+
+  while IFS='|' read -r session path status phase; do
+    [ -z "$session" ] && continue
+    if [ "$status" = "verify" ]; then
+      needs_verify+=("$session")
+      verify_paths+=("$path")
+      verify_phases+=("$phase")
+    fi
+  done <<< "$scan"
+
+  if [ ${#needs_verify[@]} -eq 0 ]; then
+    echo "No repos need verification right now."
+    return
+  fi
+
+  echo "${#needs_verify[@]} repo(s) have work ready for review:"
+  echo ""
+  for ((i = 0; i < ${#needs_verify[@]}; i++)); do
+    echo "  ${needs_verify[$i]} — Phase ${verify_phases[$i]}"
+  done
+  echo ""
+  read -rp "Start verification? (y/N): " choice
+  [ "$choice" != "y" ] && [ "$choice" != "Y" ] && return
+
+  for ((i = 0; i < ${#needs_verify[@]}; i++)); do
+    local session="${needs_verify[$i]}"
+    local path="${verify_paths[$i]}"
+    local phase="${verify_phases[$i]}"
+
+    echo ""
+    echo "━━━ $session · Phase $phase ━━━"
+    echo "Opening Claude Code. Run /gsd:verify-work"
+    echo "Exit Claude when done."
+    echo ""
+    read -rp "Press Enter to open $session..." _
+
+    _vm_exec "cd $path && claude --dangerously-skip-permissions"
+
+    echo ""
+    echo "✓ Done with $session"
+  done
+
+  echo ""
+  echo "All verifications complete."
+}
+
+# ── dev priority ─────────────────────────────────────────────────
+
+cmd_priority() {
+  if [ $# -gt 0 ]; then
+    # Inline mode: dev priority aihub-infra todolisto m2-labs
+    local list=""
+    for name in "$@"; do
+      list+="$name"$'\n'
+    done
+    printf '%s' "$list" | $SSH_CMD -o BatchMode=yes "$SSH_HOST" "cat > ~/.gsd-priority"
+    echo "✓ Priority set:"
+    local pos=1
+    for name in "$@"; do
+      echo "  $pos. $name"
+      ((pos++))
+    done
+  else
+    # Show current priority
+    echo "Current priority order:"
+    echo ""
+    local current
+    current=$($SSH_CMD -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" \
+      "cat ~/.gsd-priority 2>/dev/null") || true
+    if [ -z "$current" ]; then
+      echo "  (none set — using alphabetical order)"
+      echo ""
+      echo "Set priority: dev priority <repo1> <repo2> <repo3> ..."
+    else
+      local pos=1
+      while IFS= read -r name; do
+        [ -n "$name" ] && echo "  $pos. $name" && ((pos++))
+      done <<< "$current"
+    fi
+  fi
+}
+
 # ── Main ─────────────────────────────────────────────────────────
 
 main() {
@@ -512,6 +847,22 @@ main() {
     tunnel)
       shift
       cmd_tunnel "$@"
+      ;;
+    plan)
+      cmd_plan
+      ;;
+    launch)
+      cmd_launch
+      ;;
+    status)
+      cmd_status
+      ;;
+    verify)
+      cmd_verify
+      ;;
+    priority)
+      shift
+      cmd_priority "$@"
       ;;
     open)
       shift
