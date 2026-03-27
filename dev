@@ -665,7 +665,11 @@ cmd_plan() {
       tmux send-keys -t '$session:main.0' '/gsd:new-milestone' Enter
     "
 
-    $SSH_CMD "$SSH_HOST" -t "tmux select-window -t '$session:main' 2>/dev/null || true && tmux attach -t '$session'"
+    if ! $SSH_CMD "$SSH_HOST" -t "tmux select-window -t '$session:main' 2>/dev/null || true && tmux attach -t '$session'"; then
+      echo ""
+      echo "  SSH disconnected. To resume: ssh cloud-dev -t 'tmux attach -t $session'"
+      echo "  Run 'dev plan' again to continue."
+    fi
 
     echo ""
     echo "✓ $session milestone created"
@@ -723,7 +727,11 @@ cmd_plan() {
         tmux send-keys -t '$session:main.0' '/gsd:discuss-phase $phase' Enter
       "
 
-      $SSH_CMD "$SSH_HOST" -t "tmux select-window -t '$session:main' 2>/dev/null || true && tmux attach -t '$session'"
+      if ! $SSH_CMD "$SSH_HOST" -t "tmux select-window -t '$session:main' 2>/dev/null || true && tmux attach -t '$session'"; then
+        echo ""
+        echo "  SSH disconnected. To resume: ssh cloud-dev -t 'tmux attach -t $session'"
+        echo "  Run 'dev plan' again to continue."
+      fi
 
       echo ""
       echo "✓ $session phase $phase discussed"
@@ -757,21 +765,16 @@ cmd_launch() {
     fi
   fi
 
-  # Ensure runner script exists on VM
-  local has_runner
-  has_runner=$($SSH_CMD -o BatchMode=yes "$SSH_HOST" \
-    "[ -f ~/bin/gsd-queue-runner.sh ] && echo yes || echo no")
-
-  if [ "$has_runner" = "no" ]; then
-    echo "Installing queue runner on VM..."
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ -f "$script_dir/gsd-queue-runner.sh" ]; then
-      $SSH_CMD "$SSH_HOST" "cat > ~/bin/gsd-queue-runner.sh && chmod +x ~/bin/gsd-queue-runner.sh" \
-        < "$script_dir/gsd-queue-runner.sh"
-    else
-      die "gsd-queue-runner.sh not found in $script_dir"
-    fi
+  # Always sync runner script to VM (ensures bug fixes are deployed)
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ -f "$script_dir/gsd-queue-runner.sh" ]; then
+    echo "Syncing queue runner to VM..."
+    $SSH_CMD -o BatchMode=yes "$SSH_HOST" \
+      "mkdir -p ~/bin && cat > ~/bin/gsd-queue-runner.sh && chmod +x ~/bin/gsd-queue-runner.sh" \
+      < "$script_dir/gsd-queue-runner.sh"
+  else
+    die "gsd-queue-runner.sh not found in $script_dir"
   fi
 
   # Launch the runner in its own tmux session
@@ -834,6 +837,11 @@ cmd_status() {
     echo "  Runner: active  |  WIP: $running_count/$wip  |  Memory: $memory"
   else
     echo "  Runner: stopped"
+    if echo "$state" | grep -q "|running|"; then
+      echo ""
+      echo "  WARNING: Sessions were still running when the runner stopped."
+      echo "  The VM may have rebooted. Run 'dev launch' to restart."
+    fi
   fi
   echo "  Updated: $updated"
 }
