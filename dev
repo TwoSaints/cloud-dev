@@ -143,6 +143,8 @@ GSD workflow:
   dev status                Show queue progress
   dev verify                Batch review completed work
   dev priority <repos...>   Set execution priority order
+  dev idea <repo> "text"    Capture a feature idea for a repo
+  dev ideas start           Start the idea listener (captures from phone)
 
 Inside a session:
   Ctrl+B 0        main window (claude + servers)
@@ -941,6 +943,109 @@ cmd_priority() {
   fi
 }
 
+# ── dev idea ──────────────────────────────────────────────────────
+
+NTFY_IDEAS_TOPIC="mds-ideas-fb5bf625e6e1a4d2"
+
+cmd_idea() {
+  if [ $# -lt 2 ]; then
+    echo "Usage:"
+    echo "  dev idea <repo> \"description of the feature\""
+    echo "  dev idea <repo> --file requirements.md"
+    echo ""
+    echo "Or send from your phone via the Ntfy app:"
+    echo "  Topic: $NTFY_IDEAS_TOPIC"
+    echo "  Title: repo name (e.g. todolisto)"
+    echo "  Message: feature description"
+    return 1
+  fi
+
+  local repo="$1"
+  shift
+
+  if [ "$1" = "--file" ] && [ -n "${2:-}" ]; then
+    # Send file contents
+    local file="$2"
+    [ ! -f "$file" ] && die "File not found: $file"
+    local content
+    content=$(cat "$file")
+    curl -s --max-time 10 \
+      -H "Title: $repo" \
+      --data-raw "$content" \
+      "https://ntfy.sh/$NTFY_IDEAS_TOPIC" > /dev/null 2>&1
+  else
+    # Send inline text
+    local text="$*"
+    curl -s --max-time 10 \
+      -H "Title: $repo" \
+      --data-raw "$text" \
+      "https://ntfy.sh/$NTFY_IDEAS_TOPIC" > /dev/null 2>&1
+  fi
+
+  echo "✓ Idea sent to $repo"
+  echo "  (Listener will create the backlog item and confirm via notification)"
+}
+
+# ── dev ideas ─────────────────────────────────────────────────────
+
+cmd_ideas() {
+  # Check if listener is running
+  local running
+  running=$($SSH_CMD -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" \
+    "tmux has-session -t gsd-ideas 2>/dev/null && echo yes || echo no")
+
+  case "${1:-}" in
+    start)
+      if [ "$running" = "yes" ]; then
+        echo "Idea listener is already running."
+        return
+      fi
+
+      # Sync listener script
+      local script_dir
+      script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      if [ -f "$script_dir/gsd-idea-listener.sh" ]; then
+        $SSH_CMD -o BatchMode=yes "$SSH_HOST" \
+          "mkdir -p ~/bin && cat > ~/bin/gsd-idea-listener.sh && chmod +x ~/bin/gsd-idea-listener.sh" \
+          < "$script_dir/gsd-idea-listener.sh"
+      fi
+
+      $SSH_CMD -o BatchMode=yes "$SSH_HOST" "
+        tmux new-session -d -s gsd-ideas -x 220 -y 50
+        tmux send-keys -t gsd-ideas '~/bin/gsd-idea-listener.sh' Enter
+      "
+      echo "✓ Idea listener started"
+      echo ""
+      echo "Send ideas from your phone:"
+      echo "  Ntfy app → publish to topic: $NTFY_IDEAS_TOPIC"
+      echo "  Title = repo name, Message = feature description"
+      ;;
+    stop)
+      if [ "$running" = "yes" ]; then
+        $SSH_CMD -o BatchMode=yes "$SSH_HOST" "tmux kill-session -t gsd-ideas 2>/dev/null"
+        echo "✓ Idea listener stopped"
+      else
+        echo "Listener not running."
+      fi
+      ;;
+    *)
+      if [ "$running" = "yes" ]; then
+        echo "Idea listener: running"
+      else
+        echo "Idea listener: stopped"
+      fi
+      echo ""
+      echo "  dev ideas start    Start the listener"
+      echo "  dev ideas stop     Stop the listener"
+      echo "  dev idea <repo> \"text\"   Send an idea from your PC"
+      echo ""
+      echo "From your phone (Ntfy app):"
+      echo "  Subscribe to: $NTFY_IDEAS_TOPIC"
+      echo "  To send: publish → Title = repo, Message = idea"
+      ;;
+  esac
+}
+
 # ── Main ─────────────────────────────────────────────────────────
 
 main() {
@@ -970,6 +1075,14 @@ main() {
     priority)
       shift
       cmd_priority "$@"
+      ;;
+    idea)
+      shift
+      cmd_idea "$@"
+      ;;
+    ideas)
+      shift
+      cmd_ideas "$@"
       ;;
     open)
       shift
