@@ -530,6 +530,7 @@ _vm_batch() {
 }
 
 # Scan repos for GSD status. Output: "session|path|gsd_status|phase" per line
+# For discussion status, phase may contain multiple comma-separated numbers (e.g. "3,4,5")
 _vm_gsd_scan() {
   _vm_batch '
     for s in $(tmux ls -F "#{session_name}" 2>/dev/null); do
@@ -543,7 +544,11 @@ _vm_gsd_scan() {
       [ ! -d "$phases_dir" ] && phases_dir=$(find "$path/.planning/milestones" -maxdepth 2 -name "*phases" -type d 2>/dev/null | head -1)
       [ -z "$phases_dir" ] && echo "$s|$path|done|0" && continue
 
-      found=false
+      # Collect ALL undiscussed phases and find first non-complete status
+      undiscussed=""
+      first_status=""
+      first_phase=""
+
       for phase_dir in $(ls -d "$phases_dir"/*/ 2>/dev/null | sort); do
         phase_num=$(basename "$phase_dir" | grep -oP "^\d+")
         [ -z "$phase_num" ] && continue
@@ -554,18 +559,34 @@ _vm_gsd_scan() {
         smr=$(find "$phase_dir" -name "*SUMMARY*" 2>/dev/null | head -1)
 
         if [ -z "$ctx" ]; then
-          echo "$s|$path|discussion|$phase_num"
-        elif [ -z "$pln" ]; then
-          echo "$s|$path|planning|$phase_num"
-        elif [ -z "$smr" ]; then
-          echo "$s|$path|execution|$phase_num"
-        else
-          echo "$s|$path|verify|$phase_num"
+          [ -n "$undiscussed" ] && undiscussed="$undiscussed,$phase_num" || undiscussed="$phase_num"
         fi
-        found=true
-        break
+
+        # Track first incomplete phase for overall status
+        if [ -z "$first_status" ]; then
+          if [ -z "$ctx" ]; then
+            first_status="discussion"
+            first_phase="$phase_num"
+          elif [ -z "$pln" ]; then
+            first_status="planning"
+            first_phase="$phase_num"
+          elif [ -z "$smr" ]; then
+            first_status="execution"
+            first_phase="$phase_num"
+          else
+            first_status="verify"
+            first_phase="$phase_num"
+          fi
+        fi
       done
-      $found || echo "$s|$path|done|0"
+
+      if [ -z "$first_status" ]; then
+        echo "$s|$path|done|0"
+      elif [ -n "$undiscussed" ]; then
+        echo "$s|$path|discussion|$undiscussed"
+      else
+        echo "$s|$path|$first_status|$first_phase"
+      fi
     done
   '
 }
@@ -582,7 +603,6 @@ cmd_plan() {
 
   # Categorise and display
   local needs_discussion=()
-  local needs_discussion_paths=()
   local needs_discussion_phases=()
 
   while IFS='|' read -r session path status phase; do
@@ -590,9 +610,9 @@ cmd_plan() {
     case "$status" in
       discussion)
         needs_discussion+=("$session")
-        needs_discussion_paths+=("$path")
         needs_discussion_phases+=("$phase")
-        echo "  ● $session — Phase $phase: needs discussion"
+        local phase_display="${phase//,/, }"
+        echo "  ● $session — Phases $phase_display: needs discussion"
         ;;
       planning)  echo "  ○ $session — Phase $phase: ready to plan (autonomous)" ;;
       execution) echo "  ○ $session — Phase $phase: ready to execute (autonomous)" ;;
@@ -615,20 +635,34 @@ cmd_plan() {
 
   for ((i = 0; i < ${#needs_discussion[@]}; i++)); do
     local session="${needs_discussion[$i]}"
-    local path="${needs_discussion_paths[$i]}"
-    local phase="${needs_discussion_phases[$i]}"
+    local phases_csv="${needs_discussion_phases[$i]}"
 
-    echo ""
-    echo "━━━ $session · Phase $phase ━━━"
-    echo "Opening Claude Code. Run /gsd:discuss-phase $phase"
-    echo "Exit Claude (Ctrl+C, /exit) when done."
-    echo ""
-    read -rp "Press Enter to open $session..." _
+    # Split phases into array
+    IFS=',' read -ra phases <<< "$phases_csv"
 
-    _vm_exec "cd $path && claude --dangerously-skip-permissions"
+    for phase in "${phases[@]}"; do
+      echo ""
+      echo "━━━ $session · Phase $phase ━━━"
+      echo "Claude will auto-run /gsd:discuss-phase $phase"
+      echo "Answer the questions, then Ctrl+B D to detach when done."
+      echo ""
+      read -rp "Press Enter to start..." _
 
-    echo ""
-    echo "✓ Done with $session"
+      # Start Claude in the repo's tmux pane and auto-send the discuss command
+      $SSH_CMD -o BatchMode=yes "$SSH_HOST" "
+        tmux send-keys -t '$session:main.0' C-c C-c 2>/dev/null
+        sleep 1
+        tmux send-keys -t '$session:main.0' 'claude --dangerously-skip-permissions' Enter
+        sleep 5
+        tmux send-keys -t '$session:main.0' '/gsd:discuss-phase $phase' Enter
+      "
+
+      # Attach the user to the session — they see the discussion in progress
+      $SSH_CMD "$SSH_HOST" -t "tmux select-window -t '$session:main' 2>/dev/null || true && tmux attach -t '$session'"
+
+      echo ""
+      echo "✓ $session phase $phase discussed"
+    done
   done
 
   echo ""
