@@ -31,7 +31,20 @@ MEMORY_WARN=85            # don't start new sessions above this
 MEMORY_CRIT=90            # pause lowest priority above this
 MIN_RUN_SECONDS=60        # exit faster than this = rate limited
 
+NTFY_TOPIC="mds-cloud-dev-791a67ce61aaa1fe"
+
 [ -f "$CONF_FILE" ] && source "$CONF_FILE"
+
+# ── Notifications ────────────────────────────────────────────────
+notify() {
+  local msg="$1"
+  local tag="${2:-robot_face}"
+  curl -s \
+    -H "Title: cloud-dev" \
+    -H "Tags: $tag" \
+    -d "$msg" \
+    "https://ntfy.sh/$NTFY_TOPIC" > /dev/null 2>&1 || true
+}
 
 # ── State arrays ─────────────────────────────────────────────────
 declare -A REPO_STATUS       # session -> queued|running|rate-limited|done|skipped
@@ -191,6 +204,8 @@ start_claude_in_repo() {
 
   REPO_STATUS[$session]="running"
   REPO_START_TIME[$session]=$(date +%s)
+
+  notify "$session started (phase ${REPO_PHASE[$session]})" "arrow_forward"
 }
 
 # ── Handle session completion ────────────────────────────────────
@@ -209,8 +224,10 @@ handle_completion() {
     log "RATE LIMITED: $session exited after ${runtime}s (< ${MIN_RUN_SECONDS}s)"
     REPO_STATUS[$session]="rate-limited"
     REPO_RETRY_AFTER[$session]=$((now + RATE_LIMIT_COOLDOWN))
+    notify "$session rate limited — retrying in 15m" "pause_button"
   else
     log "COMPLETED: $session (ran for ${runtime}s)"
+    notify "$session completed phase ${REPO_PHASE[$session]}" "white_check_mark"
 
     # Re-check if there's more work
     local new_status
@@ -236,6 +253,7 @@ handle_completion() {
 pause_session() {
   local session=$1
   log "PAUSING: $session (memory pressure)"
+  notify "$session paused — memory at $(get_memory_percent)%" "warning"
   tmux send-keys -t "$session:main.0" C-c C-c 2>/dev/null
   sleep 2
   # Send /exit to cleanly quit Claude if it's still running
@@ -381,6 +399,7 @@ main() {
       done
       if ! $any_rate; then
         log "=== All repos complete ==="
+        notify "All repos complete — run 'dev verify' to review" "tada"
         write_state
         break
       fi
