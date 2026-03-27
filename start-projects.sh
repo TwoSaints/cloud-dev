@@ -82,16 +82,25 @@ create_session() {
   #   │ fe  │ be │  │ frontend │      │ backend  │
   #   └─────┴────┘  └──────────┘      └──────────┘
 
+  #   Both:              Frontend only:    Backend only:     Neither:
+  #   ┌──────────────┐   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+  #   │    claude     │   │    claude     │  │    claude     │  │    claude     │
+  #   ├──────────────┤   ├──────────────┤  ├──────────────┤  └──────────────┘
+  #   │   backend    │   │   frontend   │  │   backend    │
+  #   ├──────────────┤   └──────────────┘  └──────────────┘
+  #   │  frontend(2) │
+  #   └──────────────┘
+
   if [ -n "$frontend" ] && [ -n "$backend" ]; then
-    tmux split-window -t "$name:main" -v -l 6 -c "$path"
-    tmux split-window -t "$name:main.1" -h -c "$path"
+    tmux split-window -t "$name:main" -v -l 8 -c "$path"
+    tmux split-window -t "$name:main.1" -v -l 2 -c "$path"
     tmux select-pane -t "$name:main.0" -T "claude"
-    tmux select-pane -t "$name:main.1" -T "frontend"
-    tmux select-pane -t "$name:main.2" -T "backend"
-    tmux send-keys -t "$name:main.1" "$frontend" Enter
-    tmux send-keys -t "$name:main.2" "$backend" Enter
+    tmux select-pane -t "$name:main.1" -T "backend"
+    tmux select-pane -t "$name:main.2" -T "frontend"
+    tmux send-keys -t "$name:main.1" "$backend" Enter
+    tmux send-keys -t "$name:main.2" "$frontend" Enter
   elif [ -n "$frontend" ]; then
-    tmux split-window -t "$name:main" -v -l 6 -c "$path"
+    tmux split-window -t "$name:main" -v -l 2 -c "$path"
     tmux select-pane -t "$name:main.0" -T "claude"
     tmux select-pane -t "$name:main.1" -T "frontend"
     tmux send-keys -t "$name:main.1" "$frontend" Enter
