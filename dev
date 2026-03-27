@@ -581,7 +581,14 @@ _vm_gsd_scan() {
       done
 
       if [ -z "$first_status" ]; then
-        echo "$s|$path|done|0"
+        # All phases complete — check for pending backlog items
+        has_backlog=$(find "$path/.planning/todos/pending" -name "*.md" 2>/dev/null | head -1)
+        if [ -n "$has_backlog" ]; then
+          backlog_count=$(find "$path/.planning/todos/pending" -name "*.md" 2>/dev/null | wc -l)
+          echo "$s|$path|milestone|$backlog_count"
+        else
+          echo "$s|$path|done|0"
+        fi
       elif [ -n "$undiscussed" ]; then
         echo "$s|$path|discussion|$undiscussed"
       else
@@ -602,12 +609,17 @@ cmd_plan() {
   [ -z "$scan" ] && die "No repos with .planning/ found on $SSH_HOST"
 
   # Categorise and display
+  local needs_milestone=()
   local needs_discussion=()
   local needs_discussion_phases=()
 
   while IFS='|' read -r session path status phase; do
     [ -z "$session" ] && continue
     case "$status" in
+      milestone)
+        needs_milestone+=("$session")
+        echo "  ★ $session — all phases complete, $phase backlog item(s) — needs new milestone"
+        ;;
       discussion)
         needs_discussion+=("$session")
         needs_discussion_phases+=("$phase")
@@ -617,27 +629,82 @@ cmd_plan() {
       planning)  echo "  ○ $session — Phase $phase: ready to plan (autonomous)" ;;
       execution) echo "  ○ $session — Phase $phase: ready to execute (autonomous)" ;;
       verify)    echo "  ◇ $session — Phase $phase: needs verification" ;;
-      done)      echo "  ✓ $session — all phases complete" ;;
+      done)      echo "  ✓ $session — all complete, no backlog" ;;
     esac
   done <<< "$scan"
 
   echo ""
 
-  if [ ${#needs_discussion[@]} -eq 0 ]; then
-    echo "No repos need discussion. Run 'dev launch' to start autonomous execution."
+  local total=$((${#needs_milestone[@]} + ${#needs_discussion[@]}))
+
+  if [ "$total" -eq 0 ]; then
+    echo "No repos need your input. Run 'dev launch' to start autonomous execution."
     return
   fi
 
-  echo "${#needs_discussion[@]} repo(s) need your input."
+  echo "$total repo(s) need your input."
   echo ""
-  read -rp "Start discussions? (y/N): " choice
+  read -rp "Start? (y/N): " choice
   [ "$choice" != "y" ] && [ "$choice" != "Y" ] && return
+
+  # ── Step 1: Milestone creation for repos with backlog ──────────
+  for session in "${needs_milestone[@]}"; do
+    echo ""
+    echo "━━━ $session · New Milestone ━━━"
+    echo "Claude will auto-run /gsd:new-milestone"
+    echo "Select backlog items for the next milestone."
+    echo "Ctrl+B D to detach when done."
+    echo ""
+    read -rp "Press Enter to start..." _
+
+    $SSH_CMD -o BatchMode=yes "$SSH_HOST" "
+      tmux send-keys -t '$session:main.0' C-c C-c 2>/dev/null
+      sleep 1
+      tmux send-keys -t '$session:main.0' 'claude --dangerously-skip-permissions' Enter
+      sleep 5
+      tmux send-keys -t '$session:main.0' '/gsd:new-milestone' Enter
+    "
+
+    $SSH_CMD "$SSH_HOST" -t "tmux select-window -t '$session:main' 2>/dev/null || true && tmux attach -t '$session'"
+
+    echo ""
+    echo "✓ $session milestone created"
+  done
+
+  # If milestones were created, rescan for new discussion phases
+  if [ ${#needs_milestone[@]} -gt 0 ]; then
+    echo ""
+    echo "Rescanning for new discussion phases..."
+    scan=$(_vm_gsd_scan)
+    needs_discussion=()
+    needs_discussion_phases=()
+
+    while IFS='|' read -r session path status phase; do
+      [ -z "$session" ] && continue
+      if [ "$status" = "discussion" ]; then
+        needs_discussion+=("$session")
+        needs_discussion_phases+=("$phase")
+        local phase_display="${phase//,/, }"
+        echo "  ● $session — Phases $phase_display: needs discussion"
+      fi
+    done <<< "$scan"
+    echo ""
+  fi
+
+  # ── Step 2: Discussion phases ──────────────────────────────────
+  if [ ${#needs_discussion[@]} -eq 0 ]; then
+    echo "No phases need discussion. Run 'dev launch' to start autonomous execution."
+    read -rp "Launch now? (y/N): " choice
+    if [ "$choice" = "y" ] || [ "$choice" = "Y" ]; then
+      cmd_launch
+    fi
+    return
+  fi
 
   for ((i = 0; i < ${#needs_discussion[@]}; i++)); do
     local session="${needs_discussion[$i]}"
     local phases_csv="${needs_discussion_phases[$i]}"
 
-    # Split phases into array
     IFS=',' read -ra phases <<< "$phases_csv"
 
     for phase in "${phases[@]}"; do
@@ -648,7 +715,6 @@ cmd_plan() {
       echo ""
       read -rp "Press Enter to start..." _
 
-      # Start Claude in the repo's tmux pane and auto-send the discuss command
       $SSH_CMD -o BatchMode=yes "$SSH_HOST" "
         tmux send-keys -t '$session:main.0' C-c C-c 2>/dev/null
         sleep 1
@@ -657,7 +723,6 @@ cmd_plan() {
         tmux send-keys -t '$session:main.0' '/gsd:discuss-phase $phase' Enter
       "
 
-      # Attach the user to the session — they see the discussion in progress
       $SSH_CMD "$SSH_HOST" -t "tmux select-window -t '$session:main' 2>/dev/null || true && tmux attach -t '$session'"
 
       echo ""
@@ -666,7 +731,7 @@ cmd_plan() {
   done
 
   echo ""
-  echo "All discussions complete."
+  echo "All planning complete."
   read -rp "Launch autonomous execution? (y/N): " choice
   if [ "$choice" = "y" ] || [ "$choice" = "Y" ]; then
     cmd_launch
