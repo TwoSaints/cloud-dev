@@ -184,8 +184,12 @@ process_newproject() {
 PLAN_STATE_FILE="$HOME/.gsd-plan-state"
 
 # Find the next repo needing human input (milestone or discussion)
+# Respects ~/.gsd-priority ordering.
 # Output: "session|path|status|phase" or empty
 find_next_plan_target() {
+  # Build candidate list
+  declare -A candidates  # session -> "path|status|phase"
+
   for s in $(tmux ls -F "#{session_name}" 2>/dev/null); do
     [ "$s" = "gsd-queue" ] || [ "$s" = "gsd-ideas" ] && continue
     local path
@@ -193,7 +197,6 @@ find_next_plan_target() {
            tmux display-message -t "$s:main.0" -p "#{pane_current_path}" 2>/dev/null)
     [ -z "$path" ] || [ ! -d "$path/.planning" ] && continue
 
-    # Check for pending backlog (needs milestone)
     local phases_dir="$path/.planning/phases"
     [ ! -d "$phases_dir" ] && phases_dir=$(find "$path/.planning/milestones" -maxdepth 2 -name "*phases" -type d 2>/dev/null | head -1)
 
@@ -208,8 +211,7 @@ find_next_plan_target() {
         local ctx
         ctx=$(find "$phase_dir" -name "*CONTEXT*" 2>/dev/null | head -1)
         if [ -z "$ctx" ]; then
-          echo "$s|$path|discussion|$phase_num"
-          return
+          candidates[$s]="$path|discussion|$phase_num"
         fi
         all_done=false
         break
@@ -219,12 +221,74 @@ find_next_plan_target() {
     if $all_done; then
       local has_backlog
       has_backlog=$(find "$path/.planning/todos/pending" -name "*.md" 2>/dev/null | head -1)
-      if [ -n "$has_backlog" ]; then
-        echo "$s|$path|milestone|0"
-        return
-      fi
+      [ -n "$has_backlog" ] && candidates[$s]="$path|milestone|0"
     fi
   done
+
+  [ ${#candidates[@]} -eq 0 ] && return
+
+  # Return first match by priority order
+  if [ -f "$HOME/.gsd-priority" ]; then
+    while IFS= read -r name; do
+      name=$(echo "$name" | tr -d '[:space:]')
+      [ -z "$name" ] && continue
+      if [ -n "${candidates[$name]+x}" ]; then
+        echo "$name|${candidates[$name]}"
+        return
+      fi
+    done < "$HOME/.gsd-priority"
+  fi
+
+  # Fall back to alphabetical
+  for name in $(echo "${!candidates[@]}" | tr ' ' '\n' | sort); do
+    echo "$name|${candidates[$name]}"
+    return
+  done
+}
+
+# Enable GSD text_mode for a project (required for remote control)
+_set_text_mode() {
+  local path=$1 value=$2
+  local config="$path/.planning/config.json"
+  [ ! -f "$config" ] && return
+  python3 - "$config" "$value" << 'PYEOF'
+import json, sys
+config_path, value = sys.argv[1], sys.argv[2] == "true"
+with open(config_path, "r") as f:
+    config = json.load(f)
+config.setdefault("workflow", {})["text_mode"] = value
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2)
+PYEOF
+}
+
+# Start remote-control in a session with readiness check
+_start_remote_control() {
+  local session=$1
+
+  tmux send-keys -t "$session:main.0" C-c C-c 2>/dev/null
+  sleep 1
+  tmux send-keys -t "$session:main.0" C-c 2>/dev/null
+  sleep 1
+
+  tmux send-keys -t "$session:main.0" \
+    "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
+
+  # Wait for Claude to start (poll for up to 15s)
+  for i in {1..15}; do
+    local content
+    content=$(tmux capture-pane -t "$session:main.0" -p 2>/dev/null | tail -5)
+    if echo "$content" | grep -qiE 'remote.control|listening|waiting|ready|yes.*skip'; then
+      # Send y if it's asking for confirmation
+      if echo "$content" | grep -qiE 'yes.*skip|skip.*permission|are you sure'; then
+        tmux send-keys -t "$session:main.0" "y" Enter
+        sleep 2
+      fi
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 process_plan() {
@@ -244,36 +308,36 @@ process_plan() {
   # Save state so plan-next knows where we are
   echo "$session|$path|$status|$phase" > "$PLAN_STATE_FILE"
 
-  # Source bashrc for rc function
-  source "$HOME/.bashrc" 2>/dev/null
+  # Enable GSD text_mode (required for remote control)
+  _set_text_mode "$path" true
 
-  # Start remote-control in this repo
+  # Start remote-control
   log "PLAN: starting remote-control in $session ($status, phase $phase)"
 
-  tmux send-keys -t "$session:main.0" C-c C-c 2>/dev/null
-  sleep 1
-  tmux send-keys -t "$session:main.0" \
-    "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
-  sleep 3
-  tmux send-keys -t "$session:main.0" "y" Enter
-
-  if [ "$status" = "milestone" ]; then
-    notify "Ready: $session needs a new milestone\n\nOpen Claude app and run:\n/gsd:new-milestone" "star"
+  if _start_remote_control "$session"; then
+    if [ "$status" = "milestone" ]; then
+      notify "Ready: $session needs a new milestone\n\nOpen Claude app and run:\n/gsd:new-milestone" "star"
+    else
+      notify "Ready: $session Phase $phase\n\nOpen Claude app and run:\n/gsd:discuss-phase $phase" "speech_balloon"
+    fi
   else
-    notify "Ready: $session Phase $phase\n\nOpen Claude app and run:\n/gsd:discuss-phase $phase" "speech_balloon"
+    log "ERROR: remote-control failed to start in $session"
+    notify "Failed to start remote control in $session — try again" "x"
   fi
 }
 
 process_plan_next() {
   log "PLAN-NEXT: moving to next repo"
 
-  # Stop remote-control in current repo
+  # Stop remote-control and disable text_mode in current repo
   if [ -f "$PLAN_STATE_FILE" ]; then
-    local prev_session
-    prev_session=$(cat "$PLAN_STATE_FILE" | cut -d'|' -f1)
+    local prev_session prev_path
+    prev_session=$(cut -d'|' -f1 "$PLAN_STATE_FILE")
+    prev_path=$(cut -d'|' -f2 "$PLAN_STATE_FILE")
     if [ -n "$prev_session" ]; then
       tmux send-keys -t "$prev_session:main.0" C-c C-c 2>/dev/null
       sleep 1
+      _set_text_mode "$prev_path" false
       log "PLAN-NEXT: stopped remote-control in $prev_session"
     fi
   fi
@@ -284,7 +348,7 @@ process_plan_next() {
 
   if [ -z "$target" ]; then
     rm -f "$PLAN_STATE_FILE"
-    notify "All planning complete! Send '4897:launch' to start autonomous execution." "tada"
+    notify "All planning complete!\n\nSend '4897:launch' to start autonomous execution." "tada"
     return
   fi
 
@@ -293,29 +357,33 @@ process_plan_next() {
 
   echo "$session|$path|$status|$phase" > "$PLAN_STATE_FILE"
 
-  tmux send-keys -t "$session:main.0" C-c C-c 2>/dev/null
-  sleep 1
-  tmux send-keys -t "$session:main.0" \
-    "claude remote-control --spawn=same-dir --dangerously-skip-permissions" Enter
-  sleep 3
-  tmux send-keys -t "$session:main.0" "y" Enter
+  _set_text_mode "$path" true
 
-  if [ "$status" = "milestone" ]; then
-    notify "Next: $session needs a new milestone\n\nOpen Claude app and run:\n/gsd:new-milestone" "star"
+  log "PLAN-NEXT: starting remote-control in $session ($status, phase $phase)"
+
+  if _start_remote_control "$session"; then
+    if [ "$status" = "milestone" ]; then
+      notify "Next: $session needs a new milestone\n\nOpen Claude app and run:\n/gsd:new-milestone" "star"
+    else
+      notify "Next: $session Phase $phase\n\nOpen Claude app and run:\n/gsd:discuss-phase $phase" "speech_balloon"
+    fi
   else
-    notify "Next: $session Phase $phase\n\nOpen Claude app and run:\n/gsd:discuss-phase $phase" "speech_balloon"
+    log "ERROR: remote-control failed to start in $session"
+    notify "Failed to start remote control in $session — try again" "x"
   fi
 }
 
 process_launch() {
   log "LAUNCH: starting queue runner"
 
-  # Stop any active remote-control
+  # Stop any active remote-control and clean up text_mode
   if [ -f "$PLAN_STATE_FILE" ]; then
-    local prev_session
-    prev_session=$(cat "$PLAN_STATE_FILE" | cut -d'|' -f1)
+    local prev_session prev_path
+    prev_session=$(cut -d'|' -f1 "$PLAN_STATE_FILE")
+    prev_path=$(cut -d'|' -f2 "$PLAN_STATE_FILE")
     if [ -n "$prev_session" ]; then
       tmux send-keys -t "$prev_session:main.0" C-c C-c 2>/dev/null
+      _set_text_mode "$prev_path" false
     fi
     rm -f "$PLAN_STATE_FILE"
   fi
