@@ -42,7 +42,7 @@ notify() {
   curl -s \
     -H "Title: cloud-dev" \
     -H "Tags: $tag" \
-    -d "$msg" \
+    --data-raw "$msg" \
     "https://ntfy.sh/$NTFY_TOPIC" > /dev/null 2>&1 || true
 }
 
