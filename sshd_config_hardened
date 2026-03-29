@@ -1,10 +1,12 @@
 # ─── Hardened SSH server settings ────────────────────────────────
-# These values should be set in /etc/ssh/sshd_config on the VM
-# After editing, restart SSH: sudo systemctl restart ssh
+# Deployed to /etc/ssh/sshd_config.d/hardening.conf by setup.sh
+# After manual changes, test with: sudo sshd -t
+# Then restart: sudo systemctl restart ssh
 
 PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
+AuthenticationMethods publickey
 X11Forwarding no
 AllowTcpForwarding yes
 MaxAuthTries 3

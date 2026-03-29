@@ -30,20 +30,41 @@ echo "Done."
 
 # ─── 2. Harden SSH ────────────────────────────────────────────────
 echo "[2/9] Hardening SSH..."
-sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-sed -i 's/^#*X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
-sed -i 's/^#*MaxAuthTries.*/MaxAuthTries 3/' /etc/ssh/sshd_config
-sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 300/' /etc/ssh/sshd_config
-sed -i 's/^#*ClientAliveCountMax.*/ClientAliveCountMax 2/' /etc/ssh/sshd_config
+cat > /etc/ssh/sshd_config.d/hardening.conf << 'SSHEOF'
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+X11Forwarding no
+AllowTcpForwarding yes
+MaxAuthTries 3
+ClientAliveInterval 300
+ClientAliveCountMax 2
+SSHEOF
 
-# Ensure AllowTcpForwarding is on (needed for SSH tunnels and Remote Control)
-grep -q "^AllowTcpForwarding" /etc/ssh/sshd_config \
-  && sed -i 's/^AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config \
-  || echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config
-
+sshd -t || { echo "SSH config invalid — aborting"; exit 1; }
 systemctl restart ssh
+echo "Done."
+
+# ─── 2b. Enable UFW firewall ─────────────────────────────────────
+echo "[2b/9] Enabling UFW firewall..."
+apt install -y ufw
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow ssh
+ufw --force enable
+echo "Done."
+
+# ─── 2c. Kernel network hardening ───────────────────────────────
+echo "[2c/9] Applying kernel hardening..."
+cat > /etc/sysctl.d/99-hardening.conf << 'SYSEOF'
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv6.conf.all.accept_redirects = 0
+SYSEOF
+sysctl --system > /dev/null 2>&1
 echo "Done."
 
 # ─── 3. Install core packages ─────────────────────────────────────
@@ -57,11 +78,16 @@ echo "Done."
 echo "[4/9] Installing fail2ban..."
 apt install -y fail2ban
 cat > /etc/fail2ban/jail.local << 'FAIL2BAN'
+[DEFAULT]
+bantime = 1h
+bantime.increment = true
+bantime.maxtime = 4w
+bantime.factor = 24
+
 [sshd]
 enabled = true
 port = ssh
-maxretry = 5
-bantime = 3600
+maxretry = 3
 findtime = 600
 FAIL2BAN
 systemctl enable fail2ban
@@ -162,13 +188,8 @@ echo "     - Add ~/.ssh/github_vm.pub to GitHub SSH keys"
 echo "     - npm install -g @anthropic-ai/claude-code"
 echo "     - claude  (then /login to authenticate)"
 echo "     - Copy start-projects.sh to ~/ and run it"
-echo "  3. Set up Hetzner firewall (see docs/hetzner-firewall.md)"
+echo "  3. Set up Hetzner firewall (see hetzner-firewall.md)"
 echo "  4. Reboot to apply kernel updates: sudo reboot"
 echo ""
 echo "GSD is installed globally at ~/.claude/commands/gsd/"
 echo "Verify with: /gsd:help inside any Claude Code session"
-echo "     - npm install -g @anthropic-ai/claude-code"
-echo "     - claude  (then /login to authenticate)"
-echo "     - Copy start-projects.sh to ~/ and run it"
-echo "  3. Set up Hetzner firewall (see docs/hetzner-firewall.md)"
-echo "  4. Reboot to apply kernel updates: sudo reboot"

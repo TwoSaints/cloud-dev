@@ -188,6 +188,7 @@ else
 Host cloud-dev
   HostName $CLOUD_DEV_IP
   User $CLOUD_DEV_USER
+  IdentitiesOnly yes
   ServerAliveInterval 60
   ServerAliveCountMax 10
 EOF
