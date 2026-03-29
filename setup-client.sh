@@ -15,7 +15,7 @@ SSH_CONFIG="$HOME/.ssh/config"
 ZSHRC="$HOME/.zshrc"
 BASHRC="$HOME/.bashrc"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TOTAL_STEPS=9
+TOTAL_STEPS=10
 # ──────────────────────────────────────────────────────────────────
 
 # ─── Detect OS and shell ──────────────────────────────────────────
@@ -243,9 +243,59 @@ EOF
   echo "  ✓ Added tunnel() and tunnels() to $SHELL_RC"
 fi
 
-# ─── 7. Install dev entrypoint ────────────────────────────────────
+# ─── 7. Ensure Bash 4+ (required by dev script) ─────────────────
 echo ""
-echo "[7/$TOTAL_STEPS] Installing dev command..."
+echo "[7/$TOTAL_STEPS] Ensuring Bash 4+ is available..."
+
+BASH_MAJOR=$(bash --version | head -1 | sed 's/.*version \([0-9]*\).*/\1/')
+BASH_UPGRADED=false
+
+if [ "$BASH_MAJOR" -ge 4 ] 2>/dev/null; then
+  echo "  ✓ Bash $BASH_MAJOR already installed"
+  BASH_UPGRADED=true
+else
+  echo "  Current bash is version $BASH_MAJOR (need 4+)"
+  if [ "$OS" = "mac" ]; then
+    if command -v brew &>/dev/null; then
+      echo "  Attempting to install modern bash via Homebrew..."
+      if brew install bash 2>/dev/null; then
+        BREW_BASH="$(brew --prefix)/bin/bash"
+        if [ -x "$BREW_BASH" ]; then
+          NEW_MAJOR=$("$BREW_BASH" --version | head -1 | sed 's/.*version \([0-9]*\).*/\1/')
+          if [ "$NEW_MAJOR" -ge 4 ] 2>/dev/null; then
+            echo "  ✓ Installed Bash $NEW_MAJOR via Homebrew at $BREW_BASH"
+            BASH_UPGRADED=true
+            # Ensure Homebrew bin is early in PATH so #!/usr/bin/env bash finds it
+            if ! echo "$PATH" | tr ':' '\n' | grep -qx "$(brew --prefix)/bin"; then
+              if ! grep -q "$(brew --prefix)/bin" "$SHELL_RC" 2>/dev/null; then
+                echo "" >> "$SHELL_RC"
+                echo "# Homebrew (ensures modern bash is found)" >> "$SHELL_RC"
+                echo "export PATH=\"$(brew --prefix)/bin:\$PATH\"" >> "$SHELL_RC"
+                echo "  ✓ Added $(brew --prefix)/bin to PATH in $SHELL_RC"
+              fi
+              export PATH="$(brew --prefix)/bin:$PATH"
+            fi
+          else
+            echo "  ⚠️  Homebrew bash installed but still not v4+ — will patch dev script"
+          fi
+        fi
+      else
+        echo "  ⚠️  brew install bash failed — will patch dev script"
+      fi
+    else
+      echo "  ⚠️  Homebrew not found — will patch dev script"
+    fi
+  elif [ "$OS" = "linux" ]; then
+    echo "  On Linux, update bash via your package manager:"
+    echo "    sudo apt-get install bash   # Debian/Ubuntu"
+    echo "    sudo yum install bash       # RHEL/CentOS"
+    echo "  Will patch dev script as fallback."
+  fi
+fi
+
+# ─── 8. Install dev entrypoint ────────────────────────────────────
+echo ""
+echo "[8/$TOTAL_STEPS] Installing dev command..."
 
 DEV_SOURCE="$SCRIPT_DIR/dev"
 
@@ -288,9 +338,9 @@ else
   fi
 fi
 
-# ─── 8. Install iTerm2 Terra profiles (macOS only) ────────────────
+# ─── 9. Install iTerm2 Terra profiles (macOS only) ────────────────
 echo ""
-echo "[8/$TOTAL_STEPS] Installing terminal colour profiles..."
+echo "[9/$TOTAL_STEPS] Installing terminal colour profiles..."
 
 if [ "$OS" = "mac" ] && [ -d "/Applications/iTerm.app" ]; then
   PROFILES_DIR="$HOME/Library/Application Support/iTerm2/DynamicProfiles"
@@ -313,9 +363,9 @@ else
   echo "  ✓ Skipped (iTerm2 not installed)"
 fi
 
-# ─── 9. Test connection ──────────────────────────────────────────
+# ─── 10. Test connection ─────────────────────────────────────────
 echo ""
-echo "[9/$TOTAL_STEPS] Testing connection to cloud-dev..."
+echo "[10/$TOTAL_STEPS] Testing connection to cloud-dev..."
 echo ""
 
 source "$SHELL_RC" 2>/dev/null || true
